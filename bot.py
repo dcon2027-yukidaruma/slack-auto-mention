@@ -156,12 +156,12 @@ class Store:
                           ("sending" if valid else "failed", row["event_id"]))
                 return row if valid else None
 
-    def finish(self, eid, state, due=0, result_ts=None):
+    def finish(self, eid, state, due=0, result_ts=None, cooldown_until=None):
         with self.connect() as c:
             c.execute("UPDATE events SET state=?,due=?,result_ts=? WHERE event_id=?",
                       (state, due, result_ts, eid))
-            if state == "queued":
-                c.execute("INSERT INTO control VALUES('slack',?) ON CONFLICT(name) DO UPDATE SET due=max(due,excluded.due)", (due,))
+            if cooldown_until is not None:
+                c.execute("INSERT INTO control VALUES('slack',?) ON CONFLICT(name) DO UPDATE SET due=max(due,excluded.due)", (cooldown_until,))
 
     def counts(self):
         with self.connect() as c:
@@ -241,8 +241,9 @@ class Slack:
         return "denied", None
 
 
-def process_one(store, cfg, slack, now=None):
-    now = time.time() if now is None else now
+def process_one(store, cfg, slack, clock=None):
+    clock = clock or time.time
+    now = clock()
     row = store.claim(cfg, now)
     if row is None:
         return False
@@ -251,8 +252,10 @@ def process_one(store, cfg, slack, now=None):
     except Exception:
         permission, delay = "retry", 30
     if permission != "allowed":
-        if permission == "retry" and row["attempts"] < 9:
-            store.finish(row["event_id"], "queued", now + delay)
+        if permission == "retry":
+            until = clock() + delay
+            state = "queued" if row["attempts"] < 9 else "failed"
+            store.finish(row["event_id"], state, until, cooldown_until=until)
         else:
             store.finish(row["event_id"], "failed")
         return True
@@ -265,10 +268,11 @@ def process_one(store, cfg, slack, now=None):
     except Exception:
         state, value = "uncertain", None
     if state == "rate_limited":
-        if row["attempts"] >= 9:
-            store.finish(row["event_id"], "failed")
-        else:
-            store.finish(row["event_id"], "queued", now + value)
+        # Retry-After begins when the response is received, not when claimed.
+        # Even an exhausted event must leave the global gate in place.
+        until = clock() + value
+        state = "queued" if row["attempts"] < 9 else "failed"
+        store.finish(row["event_id"], state, until, cooldown_until=until)
     elif state == "sent":
         ts = value.get("ts")
         if not isinstance(ts, str) or not TS.fullmatch(ts):

@@ -102,16 +102,44 @@ class BotTests(unittest.TestCase):
     def test_rate_limit_is_persistent_and_global(self):
         self.store.enqueue(target(event(), self.cfg), self.cfg)
         slack = FakeSlack([('rate_limited', 60), ('sent', {'ts': '1.000001'}), ('sent', {'ts': '1.000002'})])
-        process_one(self.store, self.cfg, slack, 100)
+        process_one(self.store, self.cfg, slack, lambda: 100)
         e = event()
         e['event_id'] = 'Ev02'
         e['event']['ts'] = '1793091836.135860'
         self.store.enqueue(target(e, self.cfg), self.cfg)
         self.store = Store(self.cfg.database)
-        self.assertFalse(process_one(self.store, self.cfg, slack, 159))
-        self.assertTrue(process_one(self.store, self.cfg, slack, 160))
-        self.assertTrue(process_one(self.store, self.cfg, slack, 162))
+        self.assertFalse(process_one(self.store, self.cfg, slack, lambda: 159))
+        self.assertTrue(process_one(self.store, self.cfg, slack, lambda: 160))
+        self.assertTrue(process_one(self.store, self.cfg, slack, lambda: 162))
         self.assertEqual(self.store.counts(), {'sent': 2})
+
+    def test_retry_after_starts_at_response_receipt(self):
+        self.store.enqueue(target(event(), self.cfg), self.cfg)
+        slack = FakeSlack([('rate_limited', 60), ('sent', {'ts': '1.000001'})])
+        ticks = iter([100, 115])  # the request took 15 seconds
+        process_one(self.store, self.cfg, slack, lambda: next(ticks))
+        self.store = Store(self.cfg.database)
+        self.assertFalse(process_one(self.store, self.cfg, slack, lambda: 174))
+        self.assertTrue(process_one(self.store, self.cfg, slack, lambda: 175))
+        self.assertEqual(len(slack.calls), 2)
+
+    def test_exhausted_event_retains_global_retry_after_gate(self):
+        self.store.enqueue(target(event(), self.cfg), self.cfg)
+        with self.store.connect() as c:
+            c.execute('UPDATE events SET attempts=9')
+        second = event()
+        second['event_id'] = 'Ev02'
+        second['event']['ts'] = '1793091836.135860'
+        self.store.enqueue(target(second, self.cfg), self.cfg)
+        slack = FakeSlack([('rate_limited', 60), ('sent', {'ts': '1.000001'})])
+        ticks = iter([100, 115])
+        process_one(self.store, self.cfg, slack, lambda: next(ticks))
+        self.assertEqual(self.store.counts(), {'failed': 1, 'queued': 1})
+        self.store = Store(self.cfg.database)
+        self.assertFalse(process_one(self.store, self.cfg, slack, lambda: 174))
+        self.assertEqual(len(slack.calls), 1)
+        self.assertTrue(process_one(self.store, self.cfg, slack, lambda: 175))
+        self.assertEqual(self.store.counts(), {'failed': 1, 'sent': 1})
 
     def test_unknown_outcome_and_crash_never_auto_retry(self):
         for response in [('uncertain', None), TimeoutError(), ('sent', {'ts': 1.1})]:
