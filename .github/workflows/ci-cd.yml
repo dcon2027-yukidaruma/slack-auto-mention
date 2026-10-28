@@ -1,0 +1,64 @@
+name: CI and approved dcon deployment
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Secret and private identifier scan
+        run: python3 scripts/scan_secrets.py
+      - name: Offline tests (no Slack messages)
+        run: python3 -m unittest discover -s tests -v
+      - name: Compile
+        run: python3 -m py_compile bot.py deploy/deploy.py scripts/scan_secrets.py
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    environment: dcon
+    concurrency:
+      group: dcon-slack-auto-mention
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Package exact tested revision and deploy
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$DEPLOY_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]+$ ]]
+          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]]
+          [[ -n "$DEPLOY_SSH_KEY" && -n "$DEPLOY_KNOWN_HOSTS" ]]
+          work=$(mktemp -d)
+          trap 'rm -rf -- "$work"' EXIT
+          umask 077
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$work/key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$work/known_hosts"
+          printf 'APP_REVISION=%s\n' "$GITHUB_SHA" > revision.env
+          tar -czf "$work/release.tgz" bot.py revision.env
+          digest=$(sha256sum "$work/release.tgz" | cut -d' ' -f1)
+          options=(-i "$work/key" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$work/known_hosts" -o ConnectTimeout=15)
+          scp "${options[@]}" -P "$DEPLOY_PORT" "$work/release.tgz" "$DEPLOY_USER@$DEPLOY_HOST:/var/lib/slack-auto-mention-incoming/$GITHUB_SHA.tgz"
+          ssh "${options[@]}" -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "sudo -n /usr/local/sbin/slack-auto-mention-deploy $GITHUB_SHA $digest"

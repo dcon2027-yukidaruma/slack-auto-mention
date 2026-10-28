@@ -1,0 +1,34 @@
+[Unit]
+Description=Slack fixed team mention bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=slack-auto-mention
+Group=slack-auto-mention
+WorkingDirectory=/opt/slack-auto-mention/current
+EnvironmentFile=/etc/slack-auto-mention/env
+EnvironmentFile=/opt/slack-auto-mention/current/revision.env
+ExecStart=/usr/bin/python3 -B /opt/slack-auto-mention/current/bot.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+UMask=0077
+StateDirectory=slack-auto-mention
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/lib/slack-auto-mention
+
+[Install]
+WantedBy=multi-user.target

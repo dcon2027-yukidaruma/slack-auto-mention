@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+data/
+*.sqlite3*
+*.lock
+__pycache__/
+*.pyc
+release.tgz
+revision.env
+.deploy/
