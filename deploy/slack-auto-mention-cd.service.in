@@ -1,0 +1,12 @@
+[Unit]
+Description=Approved Slack bot main-branch container delivery
+After=network-online.target
+
+[Service]
+Type=oneshot
+UMask=0077
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+TimeoutStartSec=300
+WorkingDirectory=%h/.local/share/slack-auto-mention/cd/agent
+ExecStart=/usr/bin/python3 -B %h/.local/share/slack-auto-mention/cd/agent/pull_cd.py --config %h/.config/slack-auto-mention/cd.json --apply

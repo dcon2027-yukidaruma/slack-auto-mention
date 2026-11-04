@@ -1,0 +1,12 @@
+[Unit]
+Description=Check approved Slack bot delivery every ten minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=10min
+RandomizedDelaySec=30s
+Persistent=false
+Unit=slack-auto-mention-cd.service
+
+[Install]
+WantedBy=timers.target

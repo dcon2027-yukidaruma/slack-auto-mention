@@ -1,0 +1,35 @@
+# Container delivery without production credentials in Actions
+
+This is an inactive integration candidate. It does not install or enable its timer, protect a branch, set repository variables, merge a PR, change a network, or switch the running bot. Default execution is a read-only plan; `--apply` also requires a separately approved private `enabled=true` configuration.
+
+The existing SSH host-service job now requires both `DEPLOY_ENABLED=true` and `DEPLOY_TRANSPORT=ssh-host`. The alternative container path uses `DEPLOY_TRANSPORT=vm-pull`. They are mutually exclusive. In pull mode, Actions tests the commit and marks `container-delivery-ready` successful only for an enabled push to main. The approved VM poller then uses public HTTPS reads, with no GitHub token, SSH key, OAuth grant, OIDC permission, runner registration or production secret in Actions. Do not reuse a private runner from another service.
+
+`pull_cd.py` pins this repository's numeric identity and the existing workflow ID/path. It requires protected main, a forward update from the actual running revision, the latest completed successful main-push workflow for that exact commit and repository, and successful `test` plus `container-delivery-ready` jobs for its latest attempt. PR/fork/manual runs, pending/failing reruns, changed main, incomplete results and non-forward updates hold delivery. Missing public access or rate limits never trigger a credential fallback. A repository flag can prevent new revisions becoming eligible; it does not stop an already running bot.
+
+Only `bot.py` and `deploy/container_entrypoint.py` are selected from a bounded exact-commit archive. Paths, links, duplicate aliases, special files, expansion size and Python syntax are checked without extracting the archive. Downloaded Dockerfiles, Compose files, deployment scripts and workflow code are not executed by the VM. The fixed reviewed builder uses a cached pinned official Python base. It then imports the candidate application in an isolated non-root, network-disabled, secret-free smoke container. The reviewed Compose profile is installed separately and pinned by SHA256; the delivery agent does not update itself or that profile.
+
+The deployer uses a private nonblocking lock, immutable source directories and a durable pre-switch intent. An interrupted intent requires operator reconciliation; it is not blindly replayed. Builds and health/configuration checks happen before stopping the current bot. Only the bot is recreated, using an immutable image ID, the same read-only credential file, same private SQLite state and same dedicated network. A changed credential/configuration digest, privilege boundary, unrelated-service state or Tunnel attachment holds delivery. The deployer neither modifies runtime settings nor creates/repairs networks. Missing Tunnel attachment requires an operator to restore the previously approved connection.
+
+Readiness must report the candidate revision. On failure, the previous immutable image is restored and checked without reverting the ledger or runtime configuration. Failed revisions are quarantined. Failed rollback stops only the owned bot and preserves state; an unknown stop/rollback outcome keeps the intent for manual reconciliation. Old images are retained, and no prune or unrelated service restart is performed. Logs contain only fixed reasons and revision/run identifiers.
+
+## Approval and installation inputs
+
+Before any installation/activation, review the additional trust: approved changes merged into this repository's protected main will become bot code on the VM, with the bot's existing credential/state access. The deployer uses the existing VM owner's local Docker access; Docker access itself is powerful and is not created or expanded by this integration. This is still a new persistent remote-code promotion path requiring explicit activation approval.
+
+Required inputs/actions, not performed by these files:
+
+1. Protect main (at least require the `test` check, prevent force pushes and deletion); do not bypass review or approve/merge PRs automatically. The agent refuses unprotected main.
+2. Set repository variables `DEPLOY_TRANSPORT=vm-pull` and `DEPLOY_ENABLED=true` only when choosing this route. Keep the SSH host path disabled. No repository secret is needed.
+3. Install the reviewed agent in `~/.local/share/slack-auto-mention/cd/agent/pull_cd.py` and the reviewed profile in `~/.local/share/slack-auto-mention/cd/approved/compose.ingress.yml`. All parent directories including `empty-docker-config` must be owned by the VM user, mode0700. The profile must be0600. Use the existing rootful local Docker socket and installed Compose plugin; do not change Docker permissions or copy a registry credential configuration.
+4. Create `~/.config/slack-auto-mention/cd.json` from `pull-cd.example.json`, mode0600. Fill the inspected cached `python@sha256:…` base and SHA256 of the reviewed profile; keep `enabled=false` until explicit activation approval. Existing bot credentials are not entered again or copied into this JSON.
+5. Run the default read-only plan and inspect its result. Copy the reviewed `.service.in`/`.timer.in` templates to the corresponding user unit names only after approval. Set `enabled=true` and enable the user timer only when the production promotion is authorized. Ten-minute polling is proposed, not already active. The first post-install delivery may wait until the draft implementation has been reviewed/merged and exact main CI succeeds.
+
+Do not enable lingering, grant sudo, change a firewall/Tailscale policy, register a runner, or create credentials as an implicit installation step. If existing user-session lifetime does not meet the required uptime, report that separately.
+
+## Rollback and disable
+
+Stop/disable only `slack-auto-mention-cd.timer` and set its private configuration `enabled=false` to stop future checks. Set `DEPLOY_ENABLED=false` to prevent future delivery gates. Those actions leave the current bot and ledger running. An application rollback must reuse the reviewed profile, previous immutable image ID and previous revision recorded in `receipt.json`; keep the same runtime file, state and four-recipient/channel allowlists. Never clear the ledger or assume a prior unknown Slack send should be resent. Investigate `intent.json`/`failed.json` before manually clearing a hold; do not automatically delete them and retry.
+
+Offline tests cover source/CI identity rejection, latest-attempt handling, archive safety, default plan/no apply, configuration races, build failure, health rollback, rollback failure, crash intent, quarantine and locking. A successful offline test is not a production delivery claim. The running source revision remains unchanged until a separately authorized activation and verified switch.
+
+References: [GitHub workflow runs](https://docs.github.com/en/rest/actions/workflow-runs), [workflow jobs](https://docs.github.com/en/rest/actions/workflow-jobs), [protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches).

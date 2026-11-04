@@ -1,0 +1,6 @@
+*
+!bot.py
+!deploy
+deploy/*
+!deploy/Dockerfile
+!deploy/container_entrypoint.py
