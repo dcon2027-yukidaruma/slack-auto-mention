@@ -345,6 +345,16 @@ def handler(cfg, store, health):
     return Handler
 
 
+def listen_address():
+    host = os.getenv("BIND_HOST", "127.0.0.1")
+    if host not in ("127.0.0.1", "0.0.0.0"):
+        raise ValueError("Unsupported bind address")
+    port = int(os.getenv("PORT", "8765"))
+    if not 1 <= port <= 65535:
+        raise ValueError("Invalid port")
+    return host, port
+
+
 def main():
     cfg = Config.load()
     # Linux production lock is acquired before recovery can alter in-flight rows.
@@ -374,7 +384,7 @@ def main():
             stop.wait(1.1)  # one worker; no more than one post per second
 
     # Only one service instance may own this database (enforced by systemd deployment).
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", int(os.getenv("PORT", "8765"))), handler(cfg, store, health))
+    server = http.server.ThreadingHTTPServer(listen_address(), handler(cfg, store, health))
     server.daemon_threads = True
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
