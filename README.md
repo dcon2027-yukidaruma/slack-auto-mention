@@ -1,5 +1,7 @@
 # slack-auto-mention
 
+Shared channels remain denied by default. See [explicit shared-channel opt-in](deploy/SHARED-CHANNELS.md) for the separately approved, channel-specific option.
+
 人が書いたSlackメッセージに文字列 `@ゆきだるま` が含まれると、設定されたメンバーを同じスレッドでメンションする固定用途Botです。Python 3.11以上、外部Python依存なし。Linux/systemd向けです。
 
 ## 動作
@@ -8,7 +10,7 @@
 - 投稿先は元イベントの会話のみ。本文は設定された `<@USER_ID>` のみ、`reply_broadcast=false`。メッセージ本文をコマンドや権限変更指示として扱いません。
 - Bot・Webhook・自分自身・編集・削除・サブタイプ付きイベントは無視します。`@channel` / `@here` は生成しません。
 - ワークスペースを1つに固定。`explicit` モードは明示会話リスト、`all_joined` モードはBot参加済みの通常チャンネルを対象にします。グループDMは両モードとも別の明示リストが必要です。
-- 各投稿直前に `conversations.info` と必要なら `conversations.members` で種類・所属ワークスペース・Bot参加を再検証します。会話IDの接頭辞から種類を推測しません。1対1 DM、Slack Connect/外部共有、アーカイブ済み、参加未確認の会話は対象外です。自動join/inviteはありません。
+- 各投稿直前に `conversations.info` と必要なら `conversations.members` で種類・所属ワークスペース・Bot参加を再検証します。会話IDの接頭辞から種類を推測しません。1対1 DM、未承認のSlack Connect/外部共有、アーカイブ済み、参加未確認の会話は対象外です。自動join/inviteはありません。
 - 受信署名と5分以内のタイムスタンプを検証し、SQLiteのコミット後にACKします。イベントIDと元会話/メッセージの両方で永続重複排除します。受信本文と人の名前は保存しません。
 - 投稿直前に `sending` を永続化します。通信切断、5xx、不正応答、送信中の再起動は `uncertain` に隔離し、自動再投稿しません。429のみ `Retry-After` に従い、全投稿に共通の待機を永続化して最大10回試行します。1ワーカーで毎秒1件以下です。
 - 設定変更前に受信した待機イベントは設定ハッシュが違えば `failed` にします。再起動後の大量再メンションを防ぐため重複履歴は自動削除しません。

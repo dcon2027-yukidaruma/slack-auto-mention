@@ -42,6 +42,7 @@ class Config:
     enabled: bool = False
     channel_mode: str = "explicit"
     group_dm_ids: tuple = ()
+    shared_channel_ids: tuple = ()
 
     @classmethod
     def load(cls):
@@ -54,6 +55,10 @@ class Config:
         channels = ids(raw_channels, "[CG]") if raw_channels else ()
         raw_groups = os.getenv("SLACK_GROUP_DM_IDS", "")
         groups = ids(raw_groups, "[CG]") if raw_groups else ()
+        raw_shared = os.getenv("SLACK_SHARED_CHANNEL_IDS", "")
+        shared = ids(raw_shared, "[CG]") if raw_shared else ()
+        if shared and (mode != "explicit" or not set(shared) <= set(channels) or set(shared) & set(groups)):
+            raise ValueError("Shared channels require explicit ordinary-channel approval")
         if mode == "explicit" and not channels and not groups:
             raise ValueError("No allowed conversations")
         members = ids(os.getenv("SLACK_MEMBER_IDS", ""), "U")
@@ -67,12 +72,19 @@ class Config:
         if not token.startswith("xoxb-") or len(secret) < 16:
             raise ValueError("Invalid credentials")
         return cls(team[0], channels, members, bot[0], token, secret,
-                   os.getenv("DATABASE_PATH", "data/events.sqlite3"), enabled, mode, groups)
+                   os.getenv("DATABASE_PATH", "data/events.sqlite3"), enabled, mode, groups, shared)
+
+    def allows_shared(self, channel):
+        return (self.channel_mode == "explicit" and channel in self.channels
+                and channel in self.shared_channel_ids and channel not in self.group_dm_ids)
 
     @property
     def fingerprint(self):
         value = [self.team, sorted(self.channels), sorted(self.members), self.bot_user,
                  self.channel_mode, sorted(self.group_dm_ids)]
+        # Preserve the existing policy hash when the new opt-in is unused.
+        if self.shared_channel_ids:
+            value.append(sorted(self.shared_channel_ids))
         return hashlib.sha256(json.dumps(value).encode()).hexdigest()
 
 
@@ -81,8 +93,6 @@ def target(payload, cfg):
     if not cfg.enabled or not isinstance(payload, dict):
         return None
     if payload.get("type") != "event_callback" or payload.get("team_id") != cfg.team:
-        return None
-    if payload.get("is_ext_shared_channel"):
         return None
     e = payload.get("event")
     if not isinstance(e, dict) or e.get("type") != "message":
@@ -94,6 +104,8 @@ def target(payload, cfg):
         return None
     channel = e.get("channel")
     if not isinstance(channel, str) or not re.fullmatch(r"[CG][A-Z0-9]{8,}", channel):
+        return None
+    if payload.get("is_ext_shared_channel") and not cfg.allows_shared(channel):
         return None
     if e.get("team", cfg.team) != cfg.team:
         return None
@@ -208,8 +220,10 @@ class Slack:
         if state != "sent":
             return ("retry", data if state == "rate_limited" else 30) if state != "failed" else ("denied", None)
         info = data.get("channel", {})
-        # Do not infer type from the ID prefix. External/Slack Connect is excluded.
-        if info.get("id") != channel or info.get("is_archived") or info.get("is_ext_shared") or info.get("is_pending_ext_shared"):
+        # Never infer type from the prefix or permit a pending external share.
+        if info.get("id") != channel or info.get("is_archived") or info.get("is_pending_ext_shared"):
+            return "denied", None
+        if info.get("is_ext_shared") and not cfg.allows_shared(channel):
             return "denied", None
         if info.get("context_team_id") != cfg.team:
             return "denied", None
