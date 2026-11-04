@@ -21,7 +21,7 @@ jobs:
       - name: Offline tests (no Slack messages)
         run: python3 -m unittest discover -s tests -v
       - name: Compile
-        run: python3 -m py_compile bot.py deploy/deploy.py deploy/container_entrypoint.py scripts/scan_secrets.py
+        run: python3 -m py_compile bot.py deploy/deploy.py deploy/container_entrypoint.py deploy/pull_cd.py scripts/scan_secrets.py
       - name: Validate unpublished container profile (dummy values only)
         env:
           SLACK_IMAGE: slack-auto-mention:offline-test
@@ -33,9 +33,23 @@ jobs:
           SLACK_ENV_FILE: /dev/null
         run: docker compose -f deploy/compose.ingress.yml config --quiet
 
+  container_delivery_gate:
+    name: container-delivery-ready
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true' && vars.DEPLOY_TRANSPORT == 'vm-pull'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Mark exact tested main revision eligible for the approved VM poller
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
+          printf 'Container delivery eligible revision: `%s`\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
   deploy:
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true' && vars.DEPLOY_TRANSPORT == 'ssh-host'
     environment: dcon
     concurrency:
       group: dcon-slack-auto-mention
