@@ -29,7 +29,26 @@ class SharedChannelTests(unittest.TestCase):
                 altered = message | {'event': message['event'] | change}
                 self.assertIsNone(target(altered, self.approved))
         self.assertIsNone(target(message | {'team_id': 'T00000002'}, self.approved))
-        self.assertIsNone(target(message, dataclasses.replace(self.approved, channel_mode='all_joined')))
+        self.assertEqual(target(message, dataclasses.replace(self.approved, channel_mode='all_joined'))[3], '0000000001.000001')
+
+    def test_all_joined_only_expands_internal_membership_not_other_shared_channels_or_dms(self):
+        cfg = dataclasses.replace(self.approved, channel_mode='all_joined')
+        slack = Slack('fake-token')
+        other = 'C00000002'
+        info = {'id': other, 'context_team_id': cfg.team, 'is_group': True, 'is_member': True}
+        with patch.object(slack, 'call', return_value=('sent', {'channel': info})):
+            self.assertEqual(slack.conversation_allowed(cfg, other)[0], 'allowed')
+        for change in [{'is_ext_shared': True}, {'is_pending_ext_shared': True},
+                       {'is_im': True}, {'is_mpim': True}, {'context_team_id': 'T00000002'}]:
+            with self.subTest(change=change), patch.object(slack, 'call', return_value=('sent', {'channel': info | change})):
+                self.assertEqual(slack.conversation_allowed(cfg, other)[0], 'denied')
+        with patch.object(slack, 'call', side_effect=[('sent', {'channel': info | {'is_member': False}}), ('sent', {'members': []})]):
+            self.assertEqual(slack.conversation_allowed(cfg, other)[0], 'denied')
+        message = event(); message['is_ext_shared_channel'] = True
+        message['event']['channel'] = other
+        self.assertIsNone(target(message, cfg))
+        message['event']['channel'] = cfg.channels[0]
+        self.assertIsNone(target(message, dataclasses.replace(cfg, shared_channel_ids=())))
 
     def test_runtime_metadata_rechecks_opt_in_even_if_event_flag_is_missing(self):
         info = {'id': self.base.channels[0], 'context_team_id': self.base.team,
@@ -87,7 +106,9 @@ class SharedChannelTests(unittest.TestCase):
                   'SLACK_SHARED_CHANNEL_IDS': ','.join(self.base.channels)}
         with patch.dict(os.environ, values, clear=True):
             self.assertEqual(Config.load().shared_channel_ids, self.base.channels)
-        for change in [{'SLACK_CHANNEL_MODE': 'all_joined'}, {'SLACK_SHARED_CHANNEL_IDS': 'C00000002'},
+        with patch.dict(os.environ, values | {'SLACK_CHANNEL_MODE': 'all_joined'}, clear=True):
+            self.assertTrue(Config.load().allows_shared(self.base.channels[0]))
+        for change in [{'SLACK_SHARED_CHANNEL_IDS': 'C00000002'},
                        {'SLACK_GROUP_DM_IDS': self.base.channels[0]},
                        {'SLACK_SHARED_CHANNEL_IDS': self.base.channels[0] + ',' + self.base.channels[0]}]:
             with self.subTest(change=change), patch.dict(os.environ, values | change, clear=True), self.assertRaises(ValueError):

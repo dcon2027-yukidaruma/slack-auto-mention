@@ -57,7 +57,7 @@ class Config:
         groups = ids(raw_groups, "[CG]") if raw_groups else ()
         raw_shared = os.getenv("SLACK_SHARED_CHANNEL_IDS", "")
         shared = ids(raw_shared, "[CG]") if raw_shared else ()
-        if shared and (mode != "explicit" or not set(shared) <= set(channels) or set(shared) & set(groups)):
+        if shared and (not set(shared) <= set(channels) or set(shared) & set(groups)):
             raise ValueError("Shared channels require explicit ordinary-channel approval")
         if mode == "explicit" and not channels and not groups:
             raise ValueError("No allowed conversations")
@@ -75,7 +75,7 @@ class Config:
                    os.getenv("DATABASE_PATH", "data/events.sqlite3"), enabled, mode, groups, shared)
 
     def allows_shared(self, channel):
-        return (self.channel_mode == "explicit" and channel in self.channels
+        return (self.channel_mode in ("explicit", "all_joined") and channel in self.channels
                 and channel in self.shared_channel_ids and channel not in self.group_dm_ids)
 
     @property
