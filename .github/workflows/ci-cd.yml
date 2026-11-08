@@ -21,7 +21,7 @@ jobs:
       - name: Offline tests (no Slack messages)
         run: python3 -m unittest discover -s tests -v
       - name: Compile
-        run: python3 -m py_compile bot.py deploy/deploy.py deploy/container_entrypoint.py deploy/pull_cd.py scripts/scan_secrets.py
+        run: python3 -m py_compile bot.py deploy/deploy.py deploy/container_entrypoint.py deploy/pull_cd.py deploy/roster_reader.py deploy/roster_projection.py deploy/roster_service.py scripts/scan_secrets.py
       - name: Validate unpublished container profile (dummy values only)
         env:
           SLACK_IMAGE: slack-auto-mention:offline-test
@@ -31,7 +31,9 @@ jobs:
           SLACK_GID: '65532'
           SLACK_STATE_DIR: /tmp
           SLACK_ENV_FILE: /dev/null
-        run: docker compose -f deploy/compose.ingress.yml config --quiet
+        run: |
+          docker compose -f deploy/compose.ingress.yml config --quiet
+          docker compose -f deploy/compose.roster.yml config --quiet
 
   container_delivery_gate:
     name: container-delivery-ready

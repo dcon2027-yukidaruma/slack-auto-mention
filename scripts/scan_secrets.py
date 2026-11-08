@@ -13,7 +13,8 @@ PATTERNS = [
     r'AKIA[A-Z0-9]{16}',
     r'(?i)(?:token|password|secret)\s*[:=]\s*[\x22\x27][A-Za-z0-9/+_-]{24,}[\x22\x27]',
     # Real workspace/recipient IDs belong only in private configuration.
-    r'[TUCG][A-Z0-9]{10,}',
+    # Google's literal render option is not a Slack identity.
+    r'(?!UNFORMATTED_VALUE\b)[TUCG][A-Z0-9]{10,}',
     r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}',
 ]
 

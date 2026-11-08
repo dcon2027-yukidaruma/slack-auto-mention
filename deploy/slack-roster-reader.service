@@ -1,0 +1,24 @@
+[Unit]
+Description=Private fixed-column Slack roster reader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -B %h/.local/share/slack-auto-mention/roster-reader/current/deploy/roster_service.py --config %h/.config/slack-auto-mention/roster-reader.json
+WorkingDirectory=%h/.local/share/slack-auto-mention/roster-reader/current
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/slack-roster-reader
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=default.target

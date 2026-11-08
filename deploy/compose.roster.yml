@@ -1,0 +1,45 @@
+# Separately approved profile: same isolation, plus only the private reader socket.
+name: slack-auto-mention
+services:
+  bot:
+    image: ${SLACK_IMAGE:?Set the tested revision image}
+    user: "${SLACK_UID:?Set the VM owner UID}:${SLACK_GID:?Set the VM owner GID}"
+    init: true
+    read_only: true
+    restart: "no"
+    stop_grace_period: 30s
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 256m
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    secrets: [slack_runtime]
+    volumes:
+      - type: bind
+        source: ${SLACK_STATE_DIR:?Set the existing private bot state directory}
+        target: /data
+      - type: bind
+        source: ${SLACK_STATE_DIR:?Set the existing private bot state directory}/../slack-roster-reader
+        target: /run/slack-roster
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      ingress:
+        aliases: [slack-auto-mention]
+    healthcheck:
+      test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz',timeout=2).read()"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: none
+secrets:
+  slack_runtime:
+    file: ${SLACK_ENV_FILE:?Set the existing private bot runtime file}
+networks:
+  ingress:
+    external: true
+    name: dcon-slack-ingress
