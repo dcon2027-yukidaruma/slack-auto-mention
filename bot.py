@@ -382,6 +382,7 @@ def process_one(store, cfg, slack, clock=None, *, member_provider=None, roster_h
         return True
     members = cfg.members
     if cfg.roster_mode == "fresh_sheet":
+        roster_started = time.monotonic()
         try:
             if member_provider is None:
                 raise RosterHeld("roster_provider_missing")
@@ -411,6 +412,13 @@ def process_one(store, cfg, slack, clock=None, *, member_provider=None, roster_h
             until = clock() + (delay if permission == "retry" else 0)
             store.finish(row["event_id"], "queued" if permission == "retry" and row["attempts"] < 9 else "failed",
                          until, cooldown_until=until if permission == "retry" else None)
+            return True
+        if not 0 <= time.monotonic() - roster_started <= 15:
+            until = clock() + 30
+            store.finish(row["event_id"], "queued" if row["attempts"] < 9 else "failed",
+                         until, cooldown_until=until)
+            if roster_health is not None:
+                roster_health.update(status="held", member_count=0)
             return True
     body = {"channel": row["channel"], "thread_ts": row["thread_ts"],
             "text": " ".join("<@" + member + ">" for member in members),

@@ -257,6 +257,12 @@ class FreshDeliveryTests(unittest.TestCase):
         with patch.object(self.slack,'conversation_allowed',side_effect=[('allowed',None),('denied',None)]):self.send()
         self.assertEqual(self.slack.calls,[]);self.assertEqual(self.store.counts(),{'failed':1})
 
+    def test_slow_permission_recheck_cannot_post_an_aged_roster(self):
+        self.enqueue()
+        with patch('bot.time.monotonic',side_effect=[100,116]):self.send()
+        self.assertEqual(self.slack.calls,[]);self.assertEqual(self.store.counts(),{'queued':1})
+        self.assertEqual(self.health,{'status':'held','member_count':0})
+
     def test_static_compatibility_and_mode_change_quarantines_queue(self):
         static=dataclasses.replace(self.cfg,roster_mode='static',roster_source_id='')
         self.store.enqueue(target(event(),static),static)
