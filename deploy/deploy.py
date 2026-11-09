@@ -14,6 +14,24 @@ import urllib.request
 ROOT = Path('/opt/slack-auto-mention')
 INCOMING = Path('/var/lib/slack-auto-mention-incoming')
 SERVICE = 'slack-auto-mention.service'
+LEGACY_ENV = Path('/etc/slack-auto-mention/env')
+
+
+def legacy_is_static(path=None):
+    """Fresh credentials/config must never be restarted by an older host bot."""
+    path = path or LEGACY_ENV
+    try:
+        if path.is_symlink() or not path.is_file():return False
+        with path.open() as stream:
+            for line in stream:
+                key, separator, value = line.strip().partition('=')
+                if not separator:continue
+                key = key.strip()
+                if key == 'SLACK_ROSTER_SOURCE_ID' and value.strip().strip('\"\''):return False
+                if key == 'SLACK_ROSTER_MODE' and value.strip() not in ('static', '"static"', "'static'"):
+                    return False
+        return True
+    except OSError:return False
 
 
 def verify_archive(archive, revision):
@@ -61,12 +79,17 @@ def healthy(revision):
 
 
 def activate(release, previous):
+    if not legacy_is_static():
+        raise SystemExit('Legacy deployment refused: fresh or unverifiable roster configuration')
     switch(release)
     try:
         restart()
         if not healthy(release.name):
             raise RuntimeError('New revision health check failed')
     except Exception:
+        if not legacy_is_static():
+            subprocess.run(['systemctl', 'stop', SERVICE], check=True, timeout=45)
+            raise SystemExit('Fresh roster rollback refused; service stopped; data preserved') from None
         if previous:
             switch(previous)
             restart()

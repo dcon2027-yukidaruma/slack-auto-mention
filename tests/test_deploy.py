@@ -22,7 +22,8 @@ def archive(entries):
 
 
 class DeployTests(unittest.TestCase):
-    def test_failed_health_restores_and_checks_previous_revision(self):
+    @patch('deploy.deploy.legacy_is_static', return_value=True)
+    def test_failed_health_restores_and_checks_previous_revision(self, _static):
         release, previous = Path('/releases/new'), Path('/releases/previous')
         with patch('deploy.deploy.switch') as switch, patch('deploy.deploy.restart') as restart, patch('deploy.deploy.healthy', side_effect=[False, True]) as healthy:
             with self.assertRaisesRegex(SystemExit, 'previous revision restored and healthy'):
@@ -31,11 +32,35 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(restart.call_count, 2)
             self.assertEqual(healthy.call_args_list, [call('new'), call('previous')])
 
-    def test_first_deploy_failure_stops_service(self):
+    @patch('deploy.deploy.legacy_is_static', return_value=True)
+    def test_first_deploy_failure_stops_service(self, _static):
         with patch('deploy.deploy.switch'), patch('deploy.deploy.restart'), patch('deploy.deploy.healthy', return_value=False), patch('deploy.deploy.subprocess.run') as run:
             with self.assertRaisesRegex(SystemExit, 'Initial deployment failed'):
                 activate(Path('/releases/new'), None)
             self.assertEqual(run.call_args.args[0], ['systemctl', 'stop', 'slack-auto-mention.service'])
+
+    def test_fresh_legacy_configuration_refused_before_switch(self):
+        with patch('deploy.deploy.legacy_is_static',return_value=False),patch('deploy.deploy.switch') as switch,patch('deploy.deploy.restart') as restart:
+            with self.assertRaisesRegex(SystemExit,'Legacy deployment refused'):activate(Path('/releases/new'),Path('/releases/old'))
+        switch.assert_not_called();restart.assert_not_called()
+
+    def test_fresh_configuration_during_failure_stops_instead_of_old_restart(self):
+        with patch('deploy.deploy.legacy_is_static',side_effect=[True,False]),patch('deploy.deploy.switch') as switch,patch('deploy.deploy.restart') as restart,patch('deploy.deploy.healthy',return_value=False),patch('deploy.deploy.subprocess.run') as run:
+            with self.assertRaisesRegex(SystemExit,'Fresh roster rollback refused'):activate(Path('/releases/new'),Path('/releases/old'))
+        self.assertEqual(switch.call_args_list,[call(Path('/releases/new'))]);self.assertEqual(restart.call_count,1)
+        self.assertEqual(run.call_args.args[0],['systemctl','stop','slack-auto-mention.service'])
+
+    def test_legacy_env_guard_static_fresh_and_unverifiable(self):
+        import tempfile
+        from deploy.deploy import legacy_is_static
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'env';self.assertFalse(legacy_is_static(path))
+            for body,expected in [('OTHER=fixture\n',True),('SLACK_ROSTER_MODE="static"\n',True),
+                                  ('SLACK_ROSTER_MODE="fresh_sheet"\n',False),('SLACK_ROSTER_SOURCE_ID="fixture-sheet"\n',False),
+                                  (' SLACK_ROSTER_MODE = fresh_sheet\n',False),
+                                  ('SLACK_ROSTER_SOURCE_ID \t= "fixture-sheet"\n',False),
+                                  ('SLACK_ROSTER_MODE = static\n',True)]:
+                path.write_text(body);self.assertEqual(legacy_is_static(path),expected)
 
     def test_valid_release(self):
         data = archive([('bot.py', b'print(1)\n', tarfile.REGTYPE),

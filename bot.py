@@ -1,5 +1,6 @@
 """Fixed-purpose Slack Events API bot. Python 3.11+, standard library only."""
 import dataclasses
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import http.server
@@ -7,6 +8,7 @@ import json
 import os
 import re
 import signal
+import socket
 import sqlite3
 import threading
 import time
@@ -43,6 +45,8 @@ class Config:
     channel_mode: str = "explicit"
     group_dm_ids: tuple = ()
     shared_channel_ids: tuple = ()
+    roster_mode: str = "static"
+    roster_source_id: str = ""
 
     @classmethod
     def load(cls):
@@ -61,6 +65,11 @@ class Config:
             raise ValueError("Shared channels require explicit ordinary-channel approval")
         if mode == "explicit" and not channels and not groups:
             raise ValueError("No allowed conversations")
+        roster_mode = os.getenv("SLACK_ROSTER_MODE", "static")
+        source_id = os.getenv("SLACK_ROSTER_SOURCE_ID", "")
+        if roster_mode not in ("static", "fresh_sheet") or (roster_mode == "fresh_sheet" and
+                not re.fullmatch(r"[A-Za-z0-9_-]{10,100}", source_id)):
+            raise ValueError("Invalid roster source configuration")
         members = ids(os.getenv("SLACK_MEMBER_IDS", ""), "U")
         if len(team) != 1 or len(bot) != 1 or bot[0] in members or len(members) > 50:
             raise ValueError("Invalid workspace, bot identity or members")
@@ -72,7 +81,8 @@ class Config:
         if not token.startswith("xoxb-") or len(secret) < 16:
             raise ValueError("Invalid credentials")
         return cls(team[0], channels, members, bot[0], token, secret,
-                   os.getenv("DATABASE_PATH", "data/events.sqlite3"), enabled, mode, groups, shared)
+                   os.getenv("DATABASE_PATH", "data/events.sqlite3"), enabled, mode, groups, shared,
+                   roster_mode, source_id)
 
     def allows_shared(self, channel):
         return (self.channel_mode in ("explicit", "all_joined") and channel in self.channels
@@ -85,7 +95,132 @@ class Config:
         # Preserve the existing policy hash when the new opt-in is unused.
         if self.shared_channel_ids:
             value.append(sorted(self.shared_channel_ids))
+        if self.roster_mode != "static":
+            value[2] = []  # Static members are never a fallback for a fresh roster.
+            value.append(["fresh_sheet_v1", self.roster_source_id])
         return hashlib.sha256(json.dumps(value).encode()).hexdigest()
+
+
+class RosterHeld(ValueError):
+    """A non-posting source failure. Never include source response text."""
+
+
+def roster_members(snapshot, *, source_id, request_id, event_id, requested_at, now, bot_user):
+    expected = {"schema_version", "source_id", "sheet", "request_id", "event_id",
+                "read_started_at", "read_finished_at", "rows"}
+    if (not isinstance(snapshot, dict) or set(snapshot) != expected
+            or type(snapshot["schema_version"]) is not int or snapshot["schema_version"] != 1
+            or snapshot["source_id"] != source_id or snapshot["sheet"] != "Sheet1"
+            or snapshot["request_id"] != request_id or snapshot["event_id"] != event_id):
+        raise RosterHeld("roster_schema_invalid")
+    try:
+        started = datetime.fromisoformat(snapshot["read_started_at"])
+        finished = datetime.fromisoformat(snapshot["read_finished_at"])
+        valid_time = (all(v.tzinfo is not None for v in (requested_at, started, finished, now))
+                      and requested_at <= started <= finished <= now
+                      and 0 <= (now - started).total_seconds() <= 15)
+    except (TypeError, ValueError):
+        valid_time = False
+    rows = snapshot["rows"]
+    if not valid_time or not isinstance(rows, list) or len(rows) > 5000:
+        raise RosterHeld("roster_time_or_bounds_invalid")
+    flags = {}
+    for row in rows:
+        if not isinstance(row, list) or len(row) != 2:
+            raise RosterHeld("roster_row_invalid")
+        flag, ident = row
+        if type(flag) is bool:
+            active = flag
+        elif isinstance(flag, str) and flag in ("TRUE", "FALSE", ""):
+            active = flag == "TRUE"
+        else:
+            raise RosterHeld("roster_flag_invalid")
+        if not isinstance(ident, str):
+            continue  # Numeric cells are invalid Slack IDs, never coerced or guessed.
+        ident = ident.strip()
+        if not re.fullmatch(r"U[A-Z0-9]{8,}", ident):
+            continue  # Missing/invalid IDs never become guessed recipients.
+        if ident in flags and flags[ident] != active:
+            raise RosterHeld("roster_conflicting_rows")
+        flags[ident] = active
+    members = tuple(sorted(ident for ident, active in flags.items() if active and ident != bot_user))
+    if len(members) > 50:
+        raise RosterHeld("roster_recipient_limit")
+    return members
+
+
+class FreshSheetRoster:
+    """Request-scoped reads from an explicitly provisioned local reader, never a cache.
+
+    No Google credential is loaded into this process. The fixed Unix socket is
+    NOT provisioned by this client; deploying a reader/mount is a separate step.
+    """
+    PATH = "/run/slack-roster/reader.sock"
+
+    def __init__(self, cfg, *, request=None, clock=None):
+        self.cfg = cfg
+        self.request = request or self._request
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+
+    @staticmethod
+    def _request(envelope):
+        deadline = time.monotonic() + 15
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+                stream.settimeout(15)
+                stream.connect(FreshSheetRoster.PATH)
+                stream.sendall(json.dumps(envelope, separators=(",", ":")).encode() + b"\n")
+                raw = b""
+                while not raw.endswith(b"\n"):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or len(raw) >= 131072:
+                        raise RosterHeld("roster_response_bounds")
+                    stream.settimeout(remaining)
+                    part = stream.recv(min(4096, 131072 - len(raw)))
+                    if not part:
+                        raise RosterHeld("roster_response_incomplete")
+                    raw += part
+                return json.loads(raw)
+        except Exception:
+            raise RosterHeld("roster_read_unavailable") from None
+
+    def __call__(self, event_id):
+        started = self.clock()
+        request_id = uuid.uuid4().hex
+        snapshot = self.request({"schema_version": 1, "operation": "fresh_members",
+                                 "source_id": self.cfg.roster_source_id, "sheet": "Sheet1",
+                                 "request_id": request_id, "event_id": event_id})
+        return roster_members(snapshot, source_id=self.cfg.roster_source_id,
+                              request_id=request_id, event_id=event_id,
+                              requested_at=started, now=self.clock(), bot_user=self.cfg.bot_user)
+
+
+class RosterMonitor:
+    """Bounded non-posting recovery probes; successful rows are never cached for sends."""
+    def __init__(self, provider, health, *, clock=None):
+        self.provider, self.health = provider, health
+        self.clock = clock or time.monotonic
+        self.next_probe, self.delay = 0, 30
+
+    def read(self, event_id):
+        try:
+            members = self.provider(event_id)
+        except Exception:
+            self.health.update(status="held", member_count=0)
+            self.next_probe = self.clock() + self.delay
+            self.delay = min(self.delay * 2, 300)
+            raise
+        self.health.update(status="ready" if members else "empty", member_count=len(members))
+        self.next_probe = self.clock() + self.delay
+        self.delay = 30 if members else min(self.delay * 2, 300)
+        return members
+
+    def probe_if_due(self):
+        if self.health.get("status") == "ready" or self.clock() < self.next_probe:
+            return False
+        try:self.read("health-dry-run")
+        except Exception:pass
+        return True
 
 
 def target(payload, cfg):
@@ -255,7 +390,7 @@ class Slack:
         return "denied", None
 
 
-def process_one(store, cfg, slack, clock=None):
+def process_one(store, cfg, slack, clock=None, *, member_provider=None, roster_health=None):
     clock = clock or time.time
     now = clock()
     row = store.claim(cfg, now)
@@ -273,8 +408,48 @@ def process_one(store, cfg, slack, clock=None):
         else:
             store.finish(row["event_id"], "failed")
         return True
+    members = cfg.members
+    if cfg.roster_mode == "fresh_sheet":
+        roster_started = time.monotonic()
+        try:
+            if member_provider is None:
+                raise RosterHeld("roster_provider_missing")
+            members = member_provider(row["event_id"])
+            if (not isinstance(members, (tuple, list)) or len(members) > 50
+                    or any(not isinstance(v, str) or not re.fullmatch(r"U[A-Z0-9]{8,}", v) for v in members)):
+                raise RosterHeld("roster_members_invalid")
+            members = tuple(sorted(set(members) - {cfg.bot_user}))
+            if roster_health is not None:
+                roster_health.update(status="ready" if members else "empty", member_count=len(members))
+        except Exception:
+            until = clock() + 30
+            store.finish(row["event_id"], "queued" if row["attempts"] < 9 else "failed",
+                         until, cooldown_until=until)
+            if roster_health is not None:
+                roster_health.update(status="held", member_count=0)
+            return True
+        if not members:
+            store.finish(row["event_id"], "failed")
+            return True
+        # The Sheet request may take time. Recheck conversation permission after it.
+        try:
+            permission, delay = slack.conversation_allowed(cfg, row["channel"])
+        except Exception:
+            permission, delay = "retry", 30
+        if permission != "allowed":
+            until = clock() + (delay if permission == "retry" else 0)
+            store.finish(row["event_id"], "queued" if permission == "retry" and row["attempts"] < 9 else "failed",
+                         until, cooldown_until=until if permission == "retry" else None)
+            return True
+        if not 0 <= time.monotonic() - roster_started <= 15:
+            until = clock() + 30
+            store.finish(row["event_id"], "queued" if row["attempts"] < 9 else "failed",
+                         until, cooldown_until=until)
+            if roster_health is not None:
+                roster_health.update(status="held", member_count=0)
+            return True
     body = {"channel": row["channel"], "thread_ts": row["thread_ts"],
-            "text": " ".join("<@" + member + ">" for member in cfg.members),
+            "text": " ".join("<@" + member + ">" for member in members),
             "reply_broadcast": False, "unfurl_links": False, "unfurl_media": False,
             "client_msg_id": str(uuid.uuid5(uuid.NAMESPACE_URL, cfg.team + ":" + row["event_id"]))}
     try:
@@ -326,8 +501,12 @@ def handler(cfg, store, health):
                 return self.reply(404, {})
             counts = store.counts()
             ready = cfg.enabled and health["authenticated"] and time.monotonic() - health["worker"] < 30
+            if cfg.roster_mode == "fresh_sheet":
+                ready = ready and health.get("roster", {}).get("status") == "ready"
             self.reply(200 if ready else 503, {"ready": ready, "revision": os.getenv("APP_REVISION", "unknown"),
-                                             "events": counts})
+                                             "events": counts,
+                                             **({"roster": health.get("roster", {"status": "not_read"})}
+                                                if cfg.roster_mode == "fresh_sheet" else {})})
 
         def do_POST(self):
             if self.path != "/slack/events":
@@ -387,11 +566,18 @@ def main():
         raise SystemExit("Slack identity validation failed")
     stop = threading.Event()
     health = {"authenticated": True, "worker": time.monotonic()}
+    monitor = None
+    if cfg.roster_mode == "fresh_sheet":
+        health["roster"] = {"status": "not_read", "member_count": 0}
+        monitor = RosterMonitor(FreshSheetRoster(cfg), health["roster"])
+        monitor.probe_if_due()
 
     def worker():
         while not stop.is_set():
             try:
-                process_one(store, cfg, slack)
+                process_one(store, cfg, slack, member_provider=monitor.read if monitor else None,
+                            roster_health=health.get("roster"))
+                if monitor:monitor.probe_if_due()
                 health["worker"] = time.monotonic()
             except sqlite3.Error:
                 pass  # health goes stale if durable processing is unavailable

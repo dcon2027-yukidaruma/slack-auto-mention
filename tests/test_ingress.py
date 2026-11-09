@@ -62,6 +62,16 @@ class IngressTests(unittest.TestCase):
 
 @unittest.skipUnless(hasattr(os,'getuid') and hasattr(os,'O_NOFOLLOW'),'Linux private-file semantics')
 class PrivateRuntimeTests(unittest.TestCase):
+    def test_old_container_allowlist_refuses_fresh_keys_before_bot_start(self):
+        from deploy import container_entrypoint as entry
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'runtime.env'
+            values={key:'DUMMY' for key in ('SLACK_BOT_TOKEN','SLACK_SIGNING_SECRET','SLACK_TEAM_ID','SLACK_BOT_USER_ID','SLACK_MEMBER_IDS','BOT_ENABLED','ALLOWLIST_VERIFIED')}
+            values.update(SLACK_ROSTER_MODE='fresh_sheet',SLACK_ROSTER_SOURCE_ID='fixture-sheet')
+            path.write_text(''.join(k+'='+json.dumps(v)+'\n' for k,v in values.items()));path.chmod(0o600)
+            old=entry.ALLOWED-{'SLACK_ROSTER_MODE','SLACK_ROSTER_SOURCE_ID'}
+            with patch.object(entry,'ALLOWED',old),self.assertRaises(ValueError):entry.load_private_environment(path)
+
     def test_private_file_loads_only_expected_keys_and_rejects_exposure(self):
         with tempfile.TemporaryDirectory() as temp:
             path=Path(temp)/'runtime.env'
