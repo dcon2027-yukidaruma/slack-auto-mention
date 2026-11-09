@@ -56,7 +56,10 @@ class DeployTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path=Path(temp)/'env';self.assertFalse(legacy_is_static(path))
             for body,expected in [('OTHER=fixture\n',True),('SLACK_ROSTER_MODE="static"\n',True),
-                                  ('SLACK_ROSTER_MODE="fresh_sheet"\n',False),('SLACK_ROSTER_SOURCE_ID="fixture-sheet"\n',False)]:
+                                  ('SLACK_ROSTER_MODE="fresh_sheet"\n',False),('SLACK_ROSTER_SOURCE_ID="fixture-sheet"\n',False),
+                                  (' SLACK_ROSTER_MODE = fresh_sheet\n',False),
+                                  ('SLACK_ROSTER_SOURCE_ID \t= "fixture-sheet"\n',False),
+                                  ('SLACK_ROSTER_MODE = static\n',True)]:
                 path.write_text(body);self.assertEqual(legacy_is_static(path),expected)
 
     def test_valid_release(self):

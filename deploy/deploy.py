@@ -26,6 +26,7 @@ def legacy_is_static(path=None):
             for line in stream:
                 key, separator, value = line.strip().partition('=')
                 if not separator:continue
+                key = key.strip()
                 if key == 'SLACK_ROSTER_SOURCE_ID' and value.strip().strip('\"\''):return False
                 if key == 'SLACK_ROSTER_MODE' and value.strip() not in ('static', '"static"', "'static'"):
                     return False
