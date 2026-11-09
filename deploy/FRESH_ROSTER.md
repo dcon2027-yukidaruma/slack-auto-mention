@@ -69,6 +69,16 @@ or empty fresh source is unhealthy and cannot post. A recovery must not silently
 restore enabled static recipients: retain fresh mode/hold posts or stop only this
 bot while repairing the new source. Never restore old SQLite over later receipts.
 
+After startup/read failures, non-posting recovery probes back off from30seconds to
+at most300seconds and recover health even with no events. Probe results are not
+cached for a later send. Every actual send attempt still requests its own snapshot.
+The entire read plus final conversation check must fit the15-second freshness bound.
+The legacy root/systemd deploy helper refuses fresh or unverifiable settings before
+switching and refuses static rollback if settings become fresh during a failure.
+The old container entrypoint rejects the new keys, rather than starting a static bot.
+Verify the VM is using only its approved container path before activation; do not
+install or update an unused root helper as part of this feature.
+
 Existing application pull CD packages only `bot.py` and `container_entrypoint.py`;
 the fresh client is contained there. Host reader code/unit/config and the approved
 Compose profile are independently pinned/provisioned. Keep the profile hash check

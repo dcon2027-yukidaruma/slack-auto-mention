@@ -195,6 +195,34 @@ class FreshSheetRoster:
                               requested_at=started, now=self.clock(), bot_user=self.cfg.bot_user)
 
 
+class RosterMonitor:
+    """Bounded non-posting recovery probes; successful rows are never cached for sends."""
+    def __init__(self, provider, health, *, clock=None):
+        self.provider, self.health = provider, health
+        self.clock = clock or time.monotonic
+        self.next_probe, self.delay = 0, 30
+
+    def read(self, event_id):
+        try:
+            members = self.provider(event_id)
+        except Exception:
+            self.health.update(status="held", member_count=0)
+            self.next_probe = self.clock() + self.delay
+            self.delay = min(self.delay * 2, 300)
+            raise
+        self.health.update(status="ready" if members else "empty", member_count=len(members))
+        self.next_probe = self.clock() + self.delay
+        self.delay = 30 if members else min(self.delay * 2, 300)
+        return members
+
+    def probe_if_due(self):
+        if self.health.get("status") == "ready" or self.clock() < self.next_probe:
+            return False
+        try:self.read("health-dry-run")
+        except Exception:pass
+        return True
+
+
 def target(payload, cfg):
     """Validate the outer workspace and ordinary human message. Never parse text as commands."""
     if not cfg.enabled or not isinstance(payload, dict):
@@ -538,20 +566,18 @@ def main():
         raise SystemExit("Slack identity validation failed")
     stop = threading.Event()
     health = {"authenticated": True, "worker": time.monotonic()}
-    member_provider = FreshSheetRoster(cfg) if cfg.roster_mode == "fresh_sheet" else None
-    if member_provider is not None:
+    monitor = None
+    if cfg.roster_mode == "fresh_sheet":
         health["roster"] = {"status": "not_read", "member_count": 0}
-        try:
-            members = member_provider("startup-dry-run")
-            health["roster"].update(status="ready" if members else "empty", member_count=len(members))
-        except Exception:
-            health["roster"]["status"] = "held"
+        monitor = RosterMonitor(FreshSheetRoster(cfg), health["roster"])
+        monitor.probe_if_due()
 
     def worker():
         while not stop.is_set():
             try:
-                process_one(store, cfg, slack, member_provider=member_provider,
+                process_one(store, cfg, slack, member_provider=monitor.read if monitor else None,
                             roster_health=health.get("roster"))
+                if monitor:monitor.probe_if_due()
                 health["worker"] = time.monotonic()
             except sqlite3.Error:
                 pass  # health goes stale if durable processing is unavailable

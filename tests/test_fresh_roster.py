@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from bot import Config, FreshSheetRoster, RosterHeld, Store, process_one, roster_members, target
+from bot import Config, FreshSheetRoster, RosterHeld, RosterMonitor, Store, process_one, roster_members, target
 from test_bot import FakeSlack, config, event
 from deploy.roster_projection import rows_from_columns
 from deploy.roster_reader import FreshRosterReader, batch_url
@@ -269,6 +269,59 @@ class FreshDeliveryTests(unittest.TestCase):
         self.assertFalse(self.send());self.assertEqual(self.reads,[]);self.assertEqual(self.store.counts(),{'failed':1})
         self.assertNotEqual(static.fingerprint,self.cfg.fingerprint)
         self.assertEqual(self.cfg.fingerprint,dataclasses.replace(self.cfg,members=('U00000006',)).fingerprint)
+
+
+class MonitorRecoveryTests(unittest.TestCase):
+    def test_health_endpoint_recovers_with_zero_events(self):
+        import http.client,time,threading
+        from http.server import ThreadingHTTPServer
+        from bot import handler
+        now=[0];responses=[TimeoutError(),('U00000001',)]
+        def provider(_event):
+            value=responses.pop(0)
+            if isinstance(value,Exception):raise value
+            return value
+        with tempfile.TemporaryDirectory() as temp:
+            cfg=dataclasses.replace(config(temp+'/events.sqlite3'),roster_mode='fresh_sheet',roster_source_id=SOURCE)
+            store=Store(cfg.database);health={'authenticated':True,'worker':time.monotonic(),'roster':{}}
+            monitor=RosterMonitor(provider,health['roster'],clock=lambda:now[0]);monitor.probe_if_due()
+            server=ThreadingHTTPServer(('127.0.0.1',0),handler(cfg,store,health))
+            thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+            def get():
+                connection=http.client.HTTPConnection(*server.server_address)
+                try:
+                    connection.request('GET','/healthz');response=connection.getresponse()
+                    return response.status,json.loads(response.read())
+                finally:connection.close()
+            try:
+                self.assertEqual(get()[0],503);now[0]=30;monitor.probe_if_due()
+                status,value=get();self.assertEqual(status,200);self.assertTrue(value['ready'])
+                self.assertEqual(value['roster'],{'status':'ready','member_count':1});self.assertEqual(store.counts(),{})
+            finally:server.shutdown();server.server_close();thread.join()
+
+    def test_startup_failure_recovers_without_events_and_without_posting(self):
+        times=[0];calls=[];health={};responses=[TimeoutError(),('U00000001',)]
+        def provider(event_id):
+            calls.append(event_id);value=responses.pop(0)
+            if isinstance(value,Exception):raise value
+            return value
+        monitor=RosterMonitor(provider,health,clock=lambda:times[0])
+        self.assertTrue(monitor.probe_if_due());self.assertEqual(health['status'],'held')
+        times[0]=29;self.assertFalse(monitor.probe_if_due());self.assertEqual(len(calls),1)
+        times[0]=30;self.assertTrue(monitor.probe_if_due());self.assertEqual(health,{'status':'ready','member_count':1})
+        times[0]=1000;self.assertFalse(monitor.probe_if_due());self.assertEqual(calls,['health-dry-run']*2)
+
+    def test_recovery_backoff_capped_and_probe_results_not_reused_for_events(self):
+        now=[0];calls=[];healthy=[False]
+        def provider(event_id):
+            calls.append(event_id)
+            if not healthy[0]:raise TimeoutError()
+            return ('U00000001',)
+        monitor=RosterMonitor(provider,{},clock=lambda:now[0])
+        for expected in [30,60,120,240,300,300]:
+            monitor.probe_if_due();self.assertEqual(monitor.next_probe-now[0],expected);now[0]=monitor.next_probe
+        healthy[0]=True;monitor.probe_if_due();before=len(calls);monitor.read('EvNew')
+        self.assertEqual(len(calls),before+1);self.assertEqual(calls[-1],'EvNew')
 
 
 if __name__=='__main__':unittest.main()
