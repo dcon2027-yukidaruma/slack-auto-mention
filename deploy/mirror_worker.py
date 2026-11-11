@@ -65,8 +65,9 @@ def run():
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     while not stop.is_set():
         try:
-            process_mirror_one(store, cfg, slack, discord)
-            store.heartbeat(time.time())
+            paused = (home / '.config/slack-auto-mention/mirror-worker.pause').exists()
+            if not paused:process_mirror_one(store, cfg, slack, discord)
+            store.heartbeat(time.time(),paused=paused)
         except sqlite3.Error:
             pass  # A stale heartbeat makes ingress health report unavailable.
         stop.wait(1.1)
