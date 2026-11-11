@@ -1,7 +1,11 @@
-# slack-auto-mention
+# yukidaruma-bot
 
 Optional live Slack-to-Discord forwarding (new messages, edits, deletes):
 [configuration, deployment and limits](deploy/DISCORD-MIRROR.md). Disabled by default.
+
+Repository rename requires a coordinated VM delivery-agent migration:
+[rename procedure](deploy/RENAME.md). Existing service, state and network names
+remain `slack-auto-mention` to preserve live queues and ingress routing.
 
 Shared channels remain denied by default. See [explicit shared-channel opt-in](deploy/SHARED-CHANNELS.md) for the separately approved, channel-specific option.
 

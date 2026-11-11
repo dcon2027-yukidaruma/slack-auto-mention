@@ -15,11 +15,11 @@ OLD, NEW = 'b' * 40, 'c' * 40
 PREVIOUS_IMAGE, NEXT_IMAGE = 'sha256:' + '1' * 64, 'sha256:' + '2' * 64
 
 
-def archive(files=None, *, extra=None):
+def archive(files=None, *, extra=None, repository_name='yukidaruma-bot'):
     body = io.BytesIO()
     with tarfile.open(fileobj=body, mode='w:gz') as tar:
         for name, data in (files or {'bot.py': b'pass\n', 'deploy/container_entrypoint.py': b'pass\n'}).items():
-            info = tarfile.TarInfo('slack-auto-mention-' + NEW + '/' + name)
+            info = tarfile.TarInfo(repository_name + '-' + NEW + '/' + name)
             info.size = len(data); tar.addfile(info, io.BytesIO(data))
         if extra:
             tar.addfile(extra, io.BytesIO(b'x' * extra.size))
@@ -61,7 +61,8 @@ class GateTests(unittest.TestCase):
         self.assertTrue(any('/attempts/1/jobs?' in path for path in self.http.calls))
 
     def test_repository_replacement_private_or_unprotected_main_rejected(self):
-        for key, value in [('id', 1), ('private', True), ('default_branch', 'other')]:
+        for key, value in [('id', 1), ('private', True), ('default_branch', 'other'),
+                           ('full_name', 'dcon2027-yukidaruma/slack-auto-mention')]:
             original = dict(self.http.repo); self.http.repo[key] = value
             with self.subTest(key=key), self.assertRaises(cd.Hold): self.gate.head()
             self.http.repo = original
@@ -110,12 +111,17 @@ class GateTests(unittest.TestCase):
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_renamed_repository_archive_and_old_name_rejection(self):
+        self.assertEqual(set(cd.application_files(archive(), NEW)), set(cd.APPLICATION_FILES))
+        with self.assertRaisesRegex(cd.Hold, 'unsafe_archive_path'):
+            cd.application_files(archive(repository_name='slack-auto-mention'), NEW)
+
     def test_only_two_application_sources_selected_not_remote_deployer(self):
         raw = archive({'bot.py': b'pass\n', 'deploy/container_entrypoint.py': b'pass\n', 'Dockerfile': b'RUN forbidden\n', 'deploy/pull_cd.py': b'raise RuntimeError()\n'})
         self.assertEqual(set(cd.application_files(raw, NEW)), set(cd.APPLICATION_FILES))
 
     def test_traversal_links_duplicate_aliases_missing_or_invalid_python_rejected(self):
-        prefix = 'slack-auto-mention-' + NEW + '/'
+        prefix = 'yukidaruma-bot-' + NEW + '/'
         for name, kind in [(prefix + '../escape', tarfile.REGTYPE), (prefix + 'link', tarfile.SYMTYPE),
                            (prefix + './bot.py', tarfile.REGTYPE), ('/outside', tarfile.REGTYPE)]:
             info = tarfile.TarInfo(name); info.type = kind
