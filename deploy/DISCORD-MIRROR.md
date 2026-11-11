@@ -77,12 +77,16 @@ tracked context message, so later live edits/deletes can update that one copy.
 An unavailable parent gets an explicit context placeholder rather than an
 unrelated history item. Other old unmirrored messages remain ineligible.
 
-Each post displays `Name (Slack user ID)`, message text and a source link. Supplied
-Slack profile names are preferred; otherwise `users.info` uses the existing bot
-token when `users:read` is available. Only display names/IDs/timestamps are cached,
-bounded to 2000 entries, with no email lookup or credential fallback. A missing
-profile scope/name is shown as `Slack user (ID)` and does not drop the message;
-the operator must report that limit rather than claim all names resolved.
+Each post displays the sender's name as a clickable Slack profile link, message
+text and a source link. The profile URL uses only the workspace origin returned
+by authenticated `auth.test` and that sender's validated Slack user ID. Discord
+masked-link labels escape brackets, parentheses and backslashes; no ID suffix is
+displayed. Supplied Slack profile names are preferred; otherwise `users.info`
+uses the existing bot token when `users:read` is available. Only display
+names/IDs/timestamps are cached, bounded to 2000 entries, with no email lookup or
+credential fallback. A missing profile scope/name uses the linked label
+`Slack user` and does not drop the message; report that limit rather than claim
+all names resolved. System messages without a valid user ID remain plain names.
 
 Top-level posts go to the mapped text channel. Replies go to the public Discord
 thread attached to the recorded first part of their parent. The thread has the

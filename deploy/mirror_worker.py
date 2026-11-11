@@ -59,6 +59,7 @@ def run():
     state, identity = slack.call('auth.test', {})
     if state != 'sent' or identity.get('team_id') != cfg.team or identity.get('user_id') != cfg.bot_user:
         raise ValueError('Slack identity mismatch')
+    slack.workspace_url = identity.get('url', '')
     discord = DiscordMirror(mirror_cfg, existing_discord_token(home / '.config/dcon-projects/runtime.env'))
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())

@@ -987,7 +987,7 @@ class DiscordMirror:
         return file['name'], raw
 
 
-def mirror_parts(row, cfg):
+def mirror_parts(row, cfg, *, workspace_url=''):
     data = json.loads(row['data'])
     text = html.unescape(data['text'])
     text = re.sub(r'<@([A-Z0-9]+)(?:\|[^>]+)?>', r'@\1', text)
@@ -998,7 +998,14 @@ def mirror_parts(row, cfg):
     link = 'https://app.slack.com/archives/' + row['channel'] + '/p' + row['ts'].replace('.', '')
     ident = data.get('author_id') or (data.get('author') if re.fullmatch(r'U[A-Z0-9]{8,}',data.get('author','')) else '')
     name = data.get('author_name') or (data.get('author') if data.get('author') != ident else '') or 'Slack user'
-    header = clean_mirror_name(name) + (' (' + ident + ')' if ident else '') + ' · Slack\n'
+    name = clean_mirror_name(name) or 'Slack user'
+    # Only the workspace origin returned by authenticated auth.test is trusted.
+    # Message-supplied names/URLs cannot choose the destination or break the label.
+    if (isinstance(workspace_url,str) and re.fullmatch(r'https://[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.slack\.com/',workspace_url)
+            and isinstance(ident,str) and re.fullmatch(r'U[A-Z0-9]{8,}',ident)):
+        label = re.sub(r'([\\\[\]()])', r'\\\1', name)
+        name = '[' + label + '](' + workspace_url + 'team/' + ident + ')'
+    header = name + ' · Slack\n'
     # UTF-16 units, rather than Python characters, match Discord's content limit.
     chunks, chunk, units = [], '', 0
     budget = min(1600,2000-len((header+'\n'+link).encode('utf-16-le'))//2)
@@ -1112,7 +1119,7 @@ def process_mirror_one(store, policy, slack, discord, clock=None):
             store.finish(row, 'failed');return True
         if not row['deleted']:
             row=store.resolve_author(row,slack,clock())
-            desired=mirror_parts(row,cfg)
+            desired=mirror_parts(row,cfg,workspace_url=getattr(slack,'workspace_url',''))
         if not discord.allowed(route['discord'], route['name'], uploads=any(p['files'] for p in desired)):
             store.finish(row, 'failed');return True
     except Exception:

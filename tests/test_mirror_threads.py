@@ -6,7 +6,7 @@ import sqlite3
 import unittest
 from unittest.mock import patch
 
-from bot import MirrorStore,DiscordMirror,mirror_event,valid_mirror_thread,process_mirror_one
+from bot import MirrorStore,DiscordMirror,mirror_event,mirror_parts,valid_mirror_thread,process_mirror_one
 import test_mirror as fixtures
 from test_mirror import message,DEST,GUILD,BOT,CATEGORY
 
@@ -42,7 +42,32 @@ class ThreadTests(unittest.TestCase):
         self.assertEqual(creates[0][1],'/channels/'+DEST+'/messages/'+starter+'/threads')
         self.assertEqual(self.content_writes()[-1][1],'/channels/'+starter+'/messages')
         self.assertEqual(len(self.content_writes()),2)
-        self.assertIn('Alice (U00000003)',self.content_writes()[-1][2]['content'])
+        self.assertIn('[Alice](https://example.slack.com/team/U00000003)',self.content_writes()[-1][2]['content'])
+
+    def test_profile_label_is_escaped_and_message_urls_cannot_choose_profile_origin(self):
+        p=message();p['event']['user_profile']={'display_name':r'Alice](https://evil.invalid/) [x\y'}
+        p['event']['author_url']='https://evil.invalid/'
+        self.store.enqueue(p);self.drain()
+        content=self.content_writes()[0][2]['content']
+        self.assertTrue(content.startswith(r'[Alice\]\(https://evil.invalid/\) \[x\\y](https://example.slack.com/team/U00000003)'))
+        self.assertNotIn('(U00000003)',content)
+
+    def test_untrusted_workspace_origin_or_invalid_user_id_never_forms_profile_link(self):
+        self.enqueue();row=self.store.message('C00000001',ROOT)
+        for url in ('https://example.slack.com.evil.invalid/','https://example.slack.com/@other/',
+                    'https://user'+chr(64)+'example.slack.com/','http://example.slack.com/'):
+            content=mirror_parts(row,self.cfg,workspace_url=url)[0]['content']
+            self.assertNotIn('/team/',content)
+        data=json.loads(row['data']);data['author_id']='U00000003/evil'
+        content=mirror_parts(dict(row,data=json.dumps(data)),self.cfg,workspace_url=self.slack.workspace_url)[0]['content']
+        self.assertNotIn('/team/',content)
+
+    def test_linked_author_with_escaped_label_keeps_utf16_message_limit(self):
+        p=message('😀'*3000);p['event']['user_profile']={'display_name':'['*100}
+        self.store.enqueue(p);self.drain()
+        self.assertGreater(len(self.content_writes()),1)
+        for item in self.content_writes():
+            self.assertLessEqual(len(item[2]['content'].encode('utf-16-le'))//2,2000)
 
     def test_broadcast_duplicates_in_channel_and_thread_with_distinct_nonces(self):
         self.root_and_reply(broadcast=True)
@@ -175,17 +200,17 @@ class ThreadTests(unittest.TestCase):
         self.enqueue('root');self.drain()
         self.enqueue('next',eid='EvNext',ts='1793091900.000002');self.drain()
         self.assertEqual(sum(method=='users.info' for method,_ in self.slack.calls),1)
-        self.assertIn('Alice (U00000003)',self.content_writes()[-1][2]['content'])
+        self.assertIn('[Alice](https://example.slack.com/team/U00000003)',self.content_writes()[-1][2]['content'])
 
     def test_missing_profile_scope_does_not_drop_messages_or_request_other_credentials(self):
         self.slack.profile_ok=False;self.enqueue();self.drain()
-        self.assertIn('Slack user (U00000003)',self.content_writes()[0][2]['content'])
+        self.assertIn('[Slack user](https://example.slack.com/team/U00000003)',self.content_writes()[0][2]['content'])
         self.assertEqual(self.store.counts(),{'clean':1})
 
     def test_supplied_profile_name_and_id_need_no_profile_scope(self):
         p=message();p['event']['user_profile']={'display_name':'Example Name'}
         self.store.enqueue(p);self.drain()
-        self.assertIn('Example Name (U00000003)',self.content_writes()[0][2]['content'])
+        self.assertIn('[Example Name](https://example.slack.com/team/U00000003)',self.content_writes()[0][2]['content'])
         self.assertFalse(any(method=='users.info' for method,_ in self.slack.calls))
 
     def test_v1_migration_retains_ids_without_reposting_old_clean_rows(self):

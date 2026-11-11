@@ -36,6 +36,7 @@ def message(text='hello', *, eid='Ev01', ts='1793091836.135859', version=None, k
 
 class SlackFake:
     token = 'fixture'
+    workspace_url = 'https://example.slack.com/'
     def __init__(self):self.permission, self.name, self.calls, self.profile_ok, self.roots = 'allowed', 'general', [], True, {}
     def conversation_allowed(self, cfg, channel):return self.permission, 30
     def call(self, method, body):
@@ -163,7 +164,7 @@ class MirrorTests(unittest.TestCase):
         self.enqueue(eid='EvOther', ts='1793091840.000000')
         row = self.store.claim(2000000000)
         row = self.store.resolve_author(row,self.slack,2000000000)
-        part = mirror_parts(row, self.cfg)[0]
+        part = mirror_parts(row, self.cfg,workspace_url=self.slack.workspace_url)[0]
         self.store.begin_write(row, 0, None, part['digest'])
         self.store.written(row, 0, '666666666666666666', part['digest'])
         self.store = MirrorStore(self.policy.database, self.cfg, self.policy);self.drain()
@@ -246,7 +247,7 @@ class MirrorTests(unittest.TestCase):
         p['event'].update(subtype='bot_message', bot_id='B00000001', thread_ts='1793091800.000000')
         self.store.enqueue(p);self.drain()
         text = next(c[2]['content'] for c in reversed(self.discord.calls) if c[2] and 'content' in c[2])
-        self.assertIn('Alice (U00000003)', text)
+        self.assertIn('[Alice](https://example.slack.com/team/U00000003)', text)
         self.assertIn('@U00000003', text)
         self.assertNotIn('<@', text)
 
