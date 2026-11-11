@@ -1,0 +1,24 @@
+[Unit]
+Description=Slack to Discord live message mirror using the existing Projects bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -B %h/.local/share/slack-auto-mention/mirror-worker/current/deploy/mirror_worker.py
+WorkingDirectory=%h/.local/share/slack-auto-mention/mirror-worker/current
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/slack-auto-mention
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=300
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=default.target

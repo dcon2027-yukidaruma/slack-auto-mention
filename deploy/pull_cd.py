@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-REPOSITORY = 'dcon2027-yukidaruma/slack-auto-mention'
+REPOSITORY = 'dcon2027-yukidaruma/yukidaruma-bot'
 REPOSITORY_ID = 1436489838
 WORKFLOW_ID = 398926208
 WORKFLOW_PATH = '.github/workflows/ci-cd.yml'
@@ -129,7 +129,7 @@ class GitHubGate:
 
 def application_files(raw, revision):
     require(len(raw) <= 2 * 1024 * 1024 and bool(SHA.fullmatch(revision)), 'invalid_source_archive')
-    prefix = 'slack-auto-mention-' + revision
+    prefix = REPOSITORY.rsplit('/', 1)[1] + '-' + revision
     files, names, size = {}, set(), 0
     with tarfile.open(fileobj=io.BytesIO(raw), mode='r:gz') as archive:
         for count, member in enumerate(archive, 1):
