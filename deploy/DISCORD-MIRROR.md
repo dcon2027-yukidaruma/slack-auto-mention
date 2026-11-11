@@ -31,8 +31,12 @@ manifest and a rollback release. Updating ingress does not self-update the host 
 2. Read Slack `auth.test` and the complete paginated `conversations.list` with
    the existing bot token. Check the workspace, bot membership, source names,
    private/shared state and current permissions. Only ordinary channels qualify.
-   DMs and group DMs are excluded. Shared channels still require the existing
-   explicit per-channel approval. Do not join channels or grant Slack scopes.
+   DMs and group DMs are excluded. Shared channels require explicit per-channel
+   opt-in in the mirror configuration's `shared_channels`, a unique subset of
+   its verified route IDs. This is independent of the mention feature's shared
+   allowlist; never expand mention scope merely to enable forwarding. The exact
+   source channel and Discord destination must be covered by the owner's request.
+   Do not join channels or grant Slack scopes.
 3. Read Discord application identity, guild channels, bot member and roles with
    the existing Projects token. Find exactly one category named `slack`. Match
    each text channel by exact, unique name to a Slack source. Report missing or

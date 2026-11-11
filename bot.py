@@ -558,13 +558,15 @@ class MirrorConfig:
     bot_user: str
     since: int
     routes: dict
+    shared_channels: tuple = ()
 
     @classmethod
     def load(cls):
         if os.getenv("DISCORD_MIRROR_ENABLED", "false") != "true":
             return None
         data = json.loads(os.environ["DISCORD_MIRROR_CONFIG"])
-        if (not isinstance(data, dict) or set(data) != {"guild", "category", "application", "bot_user", "since", "routes"}
+        required = {"guild", "category", "application", "bot_user", "since", "routes"}
+        if (not isinstance(data, dict) or set(data) not in (required, required | {"shared_channels"})
                 or any(not isinstance(data[k], str) or not SNOWFLAKE.fullmatch(data[k])
                        for k in ("guild", "category", "application", "bot_user"))
                 or type(data["since"]) is not int or not 1_700_000_000 <= data["since"] <= int(time.time())
@@ -579,11 +581,20 @@ class MirrorConfig:
                     or route["discord"] in destinations):
                 raise ValueError("Invalid or duplicate mirror route")
             destinations.add(route["discord"])
+        shared = data.get('shared_channels', [])
+        if (not isinstance(shared, list) or any(not isinstance(v, str) or v not in data['routes'] for v in shared)
+                or len(set(shared)) != len(shared)):
+            raise ValueError('Invalid mirror shared-channel opt-in')
+        data['shared_channels'] = tuple(shared)
         return cls(**data)
 
     @property
     def fingerprint(self):
         return hashlib.sha256(json.dumps(dataclasses.asdict(self), sort_keys=True).encode()).hexdigest()
+
+    def source_policy(self, policy):
+        return dataclasses.replace(policy, channels=tuple(self.routes), channel_mode='explicit',
+                                   group_dm_ids=(), shared_channel_ids=self.shared_channels)
 
 
 def mirror_event(payload, cfg, policy):
@@ -595,7 +606,7 @@ def mirror_event(payload, cfg, policy):
     if not isinstance(e, dict) or e.get('type') != 'message' or e.get('channel') not in cfg.routes:
         return None
     if e.get('team', policy.team) != policy.team or (payload.get('is_ext_shared_channel')
-            and not policy.allows_shared(e['channel'])):
+            and e['channel'] not in cfg.shared_channels):
         return None
     eid = payload.get('event_id')
     if not isinstance(eid, str) or not re.fullmatch(r'Ev[A-Za-z0-9]{1,100}', eid):
@@ -903,7 +914,7 @@ def process_mirror_one(store, policy, slack, discord, clock=None):
     parts = store.parts(row)
     desired = [] if row['deleted'] else mirror_parts(row, cfg)
     # Only ordinary, mapped channels. Reuse the established membership/shared-workspace guard.
-    scoped = dataclasses.replace(policy, channels=tuple(cfg.routes), channel_mode='explicit', group_dm_ids=())
+    scoped = cfg.source_policy(policy)
     try:
         permission, delay = slack.conversation_allowed(scoped, row['channel'])
         if permission != 'allowed':

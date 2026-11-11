@@ -58,7 +58,7 @@ def inspect():
         if cursor in seen:raise ValueError('Repeated Slack page cursor')
         seen.add(cursor)
     else:raise ValueError('Slack inventory exceeded bounds')
-    results, routes = [], {}
+    results, routes, shared = [], {}, []
     destinations = [c for c in channels if c.get('parent_id') == category and c.get('type') == 0]
     for destination in destinations:
         name = destination['name']
@@ -66,20 +66,23 @@ def inspect():
         entry = {'name': name, 'discord': destination['id'], 'matched_sources': len(matches)}
         if len(matches) == 1 and sum(c.get('name') == name for c in destinations) == 1:
             source = matches[0]
-            scoped = dataclasses.replace(policy, channels=(source['id'],), channel_mode='explicit', group_dm_ids=())
+            scoped = dataclasses.replace(policy, channels=(source['id'],), channel_mode='explicit', group_dm_ids=(),
+                                         shared_channel_ids=(source['id'],) if source.get('is_ext_shared') else ())
             permission, _ = slack.conversation_allowed(scoped, source['id'])
             allowed = discord.allowed(destination['id'], name, uploads=True)
             entry.update(slack=source['id'], private=bool(source.get('is_private')),
-                         shared=bool(source.get('is_ext_shared')), source_allowed=permission == 'allowed', discord_allowed=allowed)
+                         shared=bool(source.get('is_ext_shared')), source_allowed=permission == 'allowed', discord_allowed=allowed,
+                         mention_shared_opt_in=policy.allows_shared(source['id']))
             if permission == 'allowed' and allowed and not source.get('is_mpim'):
                 routes[source['id']] = {'name': name, 'discord': destination['id']}
+                if source.get('is_ext_shared'):shared.append(source['id'])
         results.append(entry)
     return {'checked_at': int(time.time()), 'posts': 0, 'writes': 0, 'inventory_complete': True,
             'application': {'id': probe.application, 'name': app['name'], 'bot_user': probe.bot_user},
             'guild': probe.guild, 'category': category, 'channels': results,
             'all_category_text_channels_verified': bool(destinations) and len(routes) == len(destinations),
             'proposal': {'guild': probe.guild, 'category': category, 'application': probe.application,
-                         'bot_user': probe.bot_user, 'routes': routes}}
+                         'bot_user': probe.bot_user, 'routes': routes, 'shared_channels': sorted(shared)}}
 
 
 if __name__ == '__main__':

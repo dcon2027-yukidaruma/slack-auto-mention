@@ -233,6 +233,31 @@ class MirrorTests(unittest.TestCase):
         self.assertIn('@U00000003', text)
         self.assertNotIn('<@', text)
 
+    def test_shared_mirror_opt_in_does_not_expand_mention_policy(self):
+        p = message();p['is_ext_shared_channel'] = True
+        self.assertIsNone(mirror_event(p, self.cfg, self.policy))
+        shared_cfg = dataclasses.replace(self.cfg, shared_channels=('C00000001',))
+        self.assertIsNotNone(mirror_event(p, shared_cfg, self.policy))
+        self.assertFalse(self.policy.allows_shared('C00000001'))
+        self.assertTrue(shared_cfg.source_policy(self.policy).allows_shared('C00000001'))
+        self.assertIsNone(target(p, self.policy))
+        original_hash = self.policy.fingerprint
+        self.store = MirrorStore(self.policy.database, shared_cfg, self.policy)
+        self.store.enqueue(p);self.drain()
+        self.assertEqual(self.discord.calls[0][0], 'POST')
+        self.assertEqual(self.policy.fingerprint, original_hash)
+
+    def test_shared_metadata_guard_remains_active_when_event_flag_is_absent(self):
+        from bot import Slack
+        p = message();self.store.enqueue(p)
+        original = Slack('fixture')
+        info = {'id': 'C00000001', 'context_team_id': self.policy.team, 'is_group': True,
+                'is_member': True, 'is_private': True, 'is_ext_shared': True, 'name': 'general'}
+        with patch.object(original, 'call', return_value=('sent', {'channel': info})):
+            process_mirror_one(self.store, self.policy, original, self.discord, lambda: 2000000000)
+        self.assertEqual(self.discord.calls, [])
+        self.assertEqual(self.store.counts(), {'failed': 1})
+
     def test_oversize_external_and_unsafe_filenames_never_leak_token(self):
         p = message()
         p['event']['files'] = [
@@ -305,6 +330,16 @@ class TransportTests(unittest.TestCase):
         data['routes']['C00000002'] = {'name': 'second', 'discord': DEST}
         with patch.dict(os.environ, {'DISCORD_MIRROR_ENABLED': 'true', 'DISCORD_MIRROR_CONFIG': json.dumps(data)}, clear=True):
             with self.assertRaises(ValueError):MirrorConfig.load()
+
+    def test_shared_opt_in_must_be_unique_subset_of_verified_routes(self):
+        data = dataclasses.asdict(settings())
+        for shared in (['C00000002'], ['C00000001', 'C00000001'], 'C00000001'):
+            data['shared_channels'] = shared
+            with patch.dict(os.environ, {'DISCORD_MIRROR_ENABLED': 'true', 'DISCORD_MIRROR_CONFIG': json.dumps(data)}, clear=True):
+                with self.assertRaises(ValueError):MirrorConfig.load()
+        data['shared_channels'] = ['C00000001']
+        with patch.dict(os.environ, {'DISCORD_MIRROR_ENABLED': 'true', 'DISCORD_MIRROR_CONFIG': json.dumps(data)}, clear=True):
+            self.assertEqual(MirrorConfig.load().shared_channels, ('C00000001',))
 
 
 if __name__ == '__main__':unittest.main()
