@@ -1,5 +1,8 @@
 # slack-auto-mention
 
+Optional live Slack-to-Discord forwarding (new messages, edits, deletes):
+[configuration, deployment and limits](deploy/DISCORD-MIRROR.md). Disabled by default.
+
 Shared channels remain denied by default. See [explicit shared-channel opt-in](deploy/SHARED-CHANNELS.md) for the separately approved, channel-specific option.
 
 人が書いたSlackメッセージに文字列 `@ゆきだるま` が含まれると、設定されたメンバーを同じスレッドでメンションする固定用途Botです。Python 3.11以上、外部Python依存なし。Linux/systemd向けです。

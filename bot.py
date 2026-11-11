@@ -1,7 +1,8 @@
-"""Fixed-purpose Slack Events API bot. Python 3.11+, standard library only."""
+"""Slack Events API mention bot and opt-in Discord mirror. Standard library only."""
 import dataclasses
 from datetime import datetime, timezone
 import hashlib
+import html
 import hmac
 import http.server
 import json
@@ -322,7 +323,7 @@ class Slack:
     def call(self, method, body):
         headers = {"Authorization": "Bearer " + self.token}
         url = "https://slack.com/api/" + method
-        if method in ("conversations.info", "conversations.members"):
+        if method in ("conversations.info", "conversations.members", "conversations.list"):
             request = urllib.request.Request(url + "?" + urllib.parse.urlencode(body), headers=headers)
         else:
             headers["Content-Type"] = "application/json; charset=utf-8"
@@ -483,7 +484,7 @@ def verified_signature(secret, headers, body, now=None):
     return hmac.compare_digest(digest, headers.get("X-Slack-Signature", ""))
 
 
-def handler(cfg, store, health):
+def handler(cfg, store, health, *, mirror=None):
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_args):
             pass
@@ -503,8 +504,13 @@ def handler(cfg, store, health):
             ready = cfg.enabled and health["authenticated"] and time.monotonic() - health["worker"] < 30
             if cfg.roster_mode == "fresh_sheet":
                 ready = ready and health.get("roster", {}).get("status") == "ready"
+            if mirror:
+                ready = ready and mirror.worker_alive(time.time())
             self.reply(200 if ready else 503, {"ready": ready, "revision": os.getenv("APP_REVISION", "unknown"),
                                              "events": counts,
+                                             **({"mirror": {"events": mirror.counts(),
+                                                  "worker_alive": mirror.worker_alive(time.time())}}
+                                                if mirror else {}),
                                              **({"roster": health.get("roster", {"status": "not_read"})}
                                                 if cfg.roster_mode == "fresh_sheet" else {})})
 
@@ -530,12 +536,444 @@ def handler(cfg, store, health):
                 item = target(payload, cfg)
                 if item:
                     store.enqueue(item, cfg)
+                if mirror:
+                    mirror.enqueue(payload)
                 self.reply(200, {})
             except (ValueError, UnicodeError):
                 self.reply(400, {})
             except (OSError, sqlite3.Error):
                 self.reply(503, {})
     return Handler
+
+
+SNOWFLAKE = re.compile(r"[0-9]{17,20}\Z")
+
+
+@dataclasses.dataclass(frozen=True)
+class MirrorConfig:
+    """Pinned, operator-verified routes. No discovery or channel creation while sending."""
+    guild: str
+    category: str
+    application: str
+    bot_user: str
+    since: int
+    routes: dict
+
+    @classmethod
+    def load(cls):
+        if os.getenv("DISCORD_MIRROR_ENABLED", "false") != "true":
+            return None
+        data = json.loads(os.environ["DISCORD_MIRROR_CONFIG"])
+        if (not isinstance(data, dict) or set(data) != {"guild", "category", "application", "bot_user", "since", "routes"}
+                or any(not isinstance(data[k], str) or not SNOWFLAKE.fullmatch(data[k])
+                       for k in ("guild", "category", "application", "bot_user"))
+                or type(data["since"]) is not int or not 1_700_000_000 <= data["since"] <= int(time.time())
+                or not isinstance(data["routes"], dict) or not 1 <= len(data["routes"]) <= 100):
+            raise ValueError("Invalid mirror activation")
+        destinations = set()
+        for channel, route in data["routes"].items():
+            if (not re.fullmatch(r"[CG][A-Z0-9]{8,}", channel) or not isinstance(route, dict)
+                    or set(route) != {"name", "discord"} or not isinstance(route["name"], str)
+                    or not route["name"] or len(route["name"]) > 100
+                    or not isinstance(route["discord"], str) or not SNOWFLAKE.fullmatch(route["discord"])
+                    or route["discord"] in destinations):
+                raise ValueError("Invalid or duplicate mirror route")
+            destinations.add(route["discord"])
+        return cls(**data)
+
+    @property
+    def fingerprint(self):
+        return hashlib.sha256(json.dumps(dataclasses.asdict(self), sort_keys=True).encode()).hexdigest()
+
+
+def mirror_event(payload, cfg, policy):
+    """Only authenticated callbacks reach this function. Keep source text inert."""
+    if (not policy.enabled or not isinstance(payload, dict) or payload.get('type') != 'event_callback'
+            or payload.get('team_id') != policy.team):
+        return None
+    e = payload.get('event')
+    if not isinstance(e, dict) or e.get('type') != 'message' or e.get('channel') not in cfg.routes:
+        return None
+    if e.get('team', policy.team) != policy.team or (payload.get('is_ext_shared_channel')
+            and not policy.allows_shared(e['channel'])):
+        return None
+    eid = payload.get('event_id')
+    if not isinstance(eid, str) or not re.fullmatch(r'Ev[A-Za-z0-9]{1,100}', eid):
+        return None
+    subtype = e.get('subtype')
+    if subtype == 'message_replied':
+        return None  # Thread metadata is not a second copy of its parent.
+    deleted = subtype == 'message_deleted'
+    message = e.get('message') if subtype == 'message_changed' else e
+    if deleted:
+        message = {'ts': e.get('deleted_ts')}
+    if not isinstance(message, dict):
+        return None
+    if message.get('subtype') == 'tombstone':
+        deleted = True
+    ts = message.get('ts')
+    version = e.get('event_ts', e.get('ts', ts))
+    if (not all(isinstance(v, str) and re.fullmatch(r'[0-9]{10}\.[0-9]{6}', v) for v in (ts, version))
+            or int(ts.split('.')[0]) < cfg.since):
+        return None  # No backfill and no mirroring edits to old, unmirrored messages.
+    thread = message.get('thread_ts', ts)
+    if not isinstance(thread, str) or not re.fullmatch(r'[0-9]{10}\.[0-9]{6}', thread):
+        return None
+    text = message.get('text', '')
+    if not isinstance(text, str):
+        return None
+    # text is the Slack accessibility fallback; preserve attachment and Block Kit text too.
+    if not text:
+        fragments = []
+        def collect(value):
+            if isinstance(value, dict):
+                if value.get('type') in ('plain_text', 'mrkdwn', 'text') and isinstance(value.get('text'), str):
+                    fragments.append(value['text'])
+                else:
+                    for child in value.values():collect(child)
+            elif isinstance(value, list):
+                for child in value:collect(child)
+        collect(message.get('blocks', []))
+        text = '\n'.join(fragments)
+    attachments = message.get('attachments', [])
+    if isinstance(attachments, list):
+        for item in attachments[:50]:
+            if isinstance(item, dict):
+                fallback = item.get('text') or item.get('fallback') or item.get('title')
+                if isinstance(fallback, str) and fallback and fallback not in text:
+                    text += '\n' + fallback
+    files = []
+    if isinstance(message.get('files'), list):
+        for f in message['files'][:100]:
+            if not isinstance(f, dict):continue
+            url = f.get('url_private_download') or f.get('url_private', '')
+            name = f.get('name') or f.get('title') or 'attachment'
+            size = f.get('size')
+            if not isinstance(name, str):name = 'attachment'
+            parsed = urllib.parse.urlsplit(url) if isinstance(url, str) else None
+            if (parsed and parsed.scheme == 'https' and parsed.hostname == 'files.slack.com'
+                    and parsed.port in (None, 443) and not parsed.username and not parsed.password
+                    and type(size) is int and 0 <= size <= 10 * 1024 * 1024):
+                files.append({'name': re.sub(r'[^\w. -]', '_', name)[:100] or 'attachment',
+                              'url': url, 'size': size})
+            else:
+                # Keep the message even if an external/oversize file cannot be uploaded.
+                text += '\n[Attachment unavailable for automatic upload: ' + name[:100] + ']'
+    profile = message.get('user_profile')
+    display = (profile.get('display_name') or profile.get('real_name')) if isinstance(profile, dict) else None
+    author = display or message.get('user') or message.get('username') or message.get('bot_id') or 'Slack'
+    author = re.sub(r'[\r\n`*_<>@]', '', str(author))[:100]
+    data = {'text': text, 'files': files, 'author': author, 'thread': thread}
+    if len(json.dumps(data).encode()) > 512 * 1024:
+        raise ValueError('Mirror message exceeds durable bounds')
+    return {'event_id': eid, 'channel': e['channel'], 'ts': ts,
+            'version': int(version.replace('.', '')), 'deleted': deleted,
+            'create': subtype not in ('message_changed', 'message_deleted'), 'data': data}
+
+
+class MirrorStore(Store):
+    """Separate tables preserve the existing mention receipts and policy hash."""
+    def __init__(self, path, cfg, policy, *, recover=True):
+        self.path, self.cfg, self.policy = path, cfg, policy
+        with self.connect() as c:
+            c.execute('''CREATE TABLE IF NOT EXISTS mirror_messages (
+                channel TEXT, ts TEXT, version INTEGER NOT NULL, generation INTEGER NOT NULL,
+                config_hash TEXT NOT NULL, data TEXT NOT NULL, create_seen INTEGER NOT NULL,
+                deleted INTEGER NOT NULL, state TEXT NOT NULL, due REAL NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(channel,ts))''')
+            c.execute('CREATE TABLE IF NOT EXISTS mirror_events (event_id TEXT PRIMARY KEY)')
+            c.execute('''CREATE TABLE IF NOT EXISTS mirror_parts (
+                channel TEXT, ts TEXT, part INTEGER, discord_id TEXT, digest TEXT,
+                state TEXT NOT NULL, PRIMARY KEY(channel,ts,part))''')
+            c.execute('CREATE TABLE IF NOT EXISTS mirror_control (name TEXT PRIMARY KEY, due REAL NOT NULL)')
+            if recover:
+                # Only the independently locked worker owns crash recovery.
+                c.execute("UPDATE mirror_messages SET state='queued' WHERE state='working'")
+                c.execute("UPDATE mirror_parts SET state='uncertain' WHERE state='sending'")
+                c.execute("UPDATE mirror_messages SET state='uncertain' WHERE EXISTS (SELECT 1 FROM mirror_parts p "
+                          "WHERE p.channel=mirror_messages.channel AND p.ts=mirror_messages.ts AND p.state='uncertain')")
+
+    def heartbeat(self, now):
+        with self.connect() as c:
+            c.execute("INSERT INTO mirror_control VALUES('worker',?) ON CONFLICT(name) DO UPDATE SET due=excluded.due", (now,))
+
+    def worker_alive(self, now):
+        with self.connect() as c:
+            value = c.execute("SELECT due FROM mirror_control WHERE name='worker'").fetchone()
+            return bool(value and 0 <= now - value[0] < 300)
+
+    def enqueue(self, payload):
+        item = mirror_event(payload, self.cfg, self.policy)
+        if item is None:return
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            if not c.execute('INSERT OR IGNORE INTO mirror_events VALUES(?)', (item['event_id'],)).rowcount:return
+            row = c.execute('SELECT * FROM mirror_messages WHERE channel=? AND ts=?',
+                            (item['channel'], item['ts'])).fetchone()
+            if row:
+                # Deletion is permanent. Delayed creates cannot overwrite newer edits.
+                if row['deleted'] or row['state'] == 'uncertain' or row['config_hash'] != self.cfg.fingerprint:return
+                create_seen = row['create_seen'] or item['create']
+                if item['version'] < row['version'] and not item['deleted']:
+                    c.execute('UPDATE mirror_messages SET create_seen=? WHERE channel=? AND ts=?',
+                              (int(create_seen), item['channel'], item['ts']))
+                    return
+                c.execute('UPDATE mirror_messages SET version=?,generation=generation+1,data=?,create_seen=?,deleted=?,state=?,attempts=0 '
+                          'WHERE channel=? AND ts=?', (item['version'], json.dumps(item['data']), int(create_seen),
+                          int(item['deleted']), 'working' if row['state'] == 'working' else 'queued', item['channel'], item['ts']))
+            else:
+                c.execute('INSERT INTO mirror_messages VALUES(?,?,?,1,?,?,?,?,\'queued\',0,0)',
+                          (item['channel'], item['ts'], item['version'], self.cfg.fingerprint,
+                           json.dumps(item['data']), int(item['create']), int(item['deleted'])))
+
+    def claim(self, now):
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            gate = c.execute("SELECT due FROM mirror_control WHERE name='discord'").fetchone()
+            if gate and gate[0] > now:return None
+            row = c.execute("SELECT * FROM mirror_messages WHERE state='queued' AND due<=? "
+                            "AND (create_seen=1 OR deleted=1) ORDER BY rowid LIMIT 1", (now,)).fetchone()
+            if row:
+                valid = self.policy.enabled and row['config_hash'] == self.cfg.fingerprint
+                c.execute('UPDATE mirror_messages SET state=?,attempts=attempts+1 WHERE channel=? AND ts=?',
+                          ('working' if valid else 'failed', row['channel'], row['ts']))
+                return row if valid else None
+
+    def parts(self, row):
+        with self.connect() as c:
+            return list(c.execute('SELECT * FROM mirror_parts WHERE channel=? AND ts=? ORDER BY part', (row['channel'], row['ts'])))
+
+    def finish(self, row, state, due=0):
+        with self.connect() as c:
+            # If another event arrived during HTTP, process its newer desired state next.
+            c.execute("UPDATE mirror_messages SET state=CASE WHEN generation!=? AND ?='clean' THEN 'queued' ELSE ? END,due=? "
+                      'WHERE channel=? AND ts=?', (row['generation'], state, state, due, row['channel'], row['ts']))
+            if due:
+                c.execute("INSERT INTO mirror_control VALUES('discord',?) ON CONFLICT(name) DO UPDATE SET due=max(due,excluded.due)", (due,))
+
+    def begin_write(self, row, part, ident, digest):
+        with self.connect() as c:
+            c.execute("INSERT INTO mirror_parts VALUES(?,?,?,?,?,'sending') ON CONFLICT(channel,ts,part) "
+                      "DO UPDATE SET state='sending'", (row['channel'], row['ts'], part, ident, digest))
+
+    def written(self, row, part, ident, digest, state='sent'):
+        with self.connect() as c:
+            c.execute('UPDATE mirror_parts SET discord_id=?,digest=?,state=? WHERE channel=? AND ts=? AND part=?',
+                      (ident, digest, state, row['channel'], row['ts'], part))
+
+    def counts(self):
+        with self.connect() as c:
+            return dict(c.execute('SELECT state,count(*) FROM mirror_messages GROUP BY state'))
+
+
+class NoCredentialRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+class DiscordMirror:
+    def __init__(self, cfg, token):
+        self.cfg, self.token = cfg, token
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoCredentialRedirect())
+
+    def call(self, method, path, body=None, files=None):
+        headers = {'Authorization': 'Bot ' + self.token, 'User-Agent': 'YukidarumaMirror/1'}
+        data = None
+        if body is not None:
+            headers['Content-Type'] = 'application/json'
+            data = json.dumps(body).encode()
+        if files:
+            boundary = 'mirror-' + uuid.uuid4().hex
+            headers['Content-Type'] = 'multipart/form-data; boundary=' + boundary
+            data = ('--' + boundary + '\r\nContent-Disposition: form-data; name="payload_json"\r\n'
+                    'Content-Type: application/json\r\n\r\n').encode() + json.dumps(body).encode() + b'\r\n'
+            for i, (name, raw) in enumerate(files):
+                # Names were sanitized at ingress; never interpolate source headers.
+                data += ('--' + boundary + '\r\nContent-Disposition: form-data; name="files[' + str(i)
+                         + ']"; filename="' + name + '"\r\nContent-Type: application/octet-stream\r\n\r\n').encode() + raw + b'\r\n'
+            data += ('--' + boundary + '--\r\n').encode()
+        req = urllib.request.Request('https://discord.com/api/v10' + path, data, headers, method=method)
+        try:
+            with self.opener.open(req, timeout=15) as response:
+                raw = response.read(2 * 1024 * 1024 + 1)
+                if len(raw) > 2 * 1024 * 1024:return 'uncertain', None
+                result = json.loads(raw) if raw else {}
+                return ('sent', result) if isinstance(result, (dict, list)) else ('uncertain', None)
+        except urllib.error.HTTPError as error:
+            if error.code == 429:
+                try:
+                    value = json.loads(error.read(4096)).get('retry_after')
+                    if type(value) in (int, float) and 0 < value <= 86400:return 'rate_limited', max(1, value)
+                except (ValueError, TypeError, AttributeError):pass
+                return 'failed', None
+            if error.code == 404 and method == 'DELETE':return 'sent', {}
+            return ('failed', None) if 400 <= error.code < 500 else ('uncertain', None)
+        except (OSError, ValueError):
+            return 'uncertain', None
+
+    def allowed(self, channel, name, *, uploads=False):
+        """Verify identity, guild/category/name and effective channel permissions each time."""
+        def get(path):
+            state, data = self.call('GET', path)
+            if state != 'sent':raise RosterHeld('discord_verification_unavailable')
+            return data
+        cfg = self.cfg
+        user, app = get('/users/@me'), get('/oauth2/applications/@me')
+        if user.get('id') != cfg.bot_user or user.get('bot') is not True or app.get('id') != cfg.application:
+            return False
+        category = get('/channels/' + cfg.category)
+        dest = get('/channels/' + channel)
+        if (category.get('guild_id') != cfg.guild or category.get('type') != 4 or category.get('name') != 'slack'
+                or dest.get('guild_id') != cfg.guild or dest.get('type') != 0
+                or dest.get('parent_id') != cfg.category or dest.get('name') != name):return False
+        member = get('/guilds/' + cfg.guild + '/members/' + cfg.bot_user)
+        roles = get('/guilds/' + cfg.guild + '/roles')
+        member_roles = set(member.get('roles', [])) | {cfg.guild}
+        permissions = 0
+        for role in roles:
+            if role.get('id') in member_roles:permissions |= int(role['permissions'])
+        if not permissions & 8:
+            overrides = dest.get('permission_overwrites', [])
+            for overwrite in overrides:
+                if overwrite.get('id') == cfg.guild:
+                    permissions = (permissions & ~int(overwrite['deny'])) | int(overwrite['allow'])
+            deny = allow = 0
+            for overwrite in overrides:
+                if overwrite.get('type') == 0 and overwrite.get('id') in member_roles - {cfg.guild}:
+                    deny |= int(overwrite['deny']);allow |= int(overwrite['allow'])
+            permissions = (permissions & ~deny) | allow
+            for overwrite in overrides:
+                if overwrite.get('type') == 1 and overwrite.get('id') == cfg.bot_user:
+                    permissions = (permissions & ~int(overwrite['deny'])) | int(overwrite['allow'])
+            required = (1 << 10) | (1 << 11) | ((1 << 15) if uploads else 0)
+            if permissions & required != required:return False
+        return member.get('user', {}).get('id') == cfg.bot_user and not member.get('communication_disabled_until')
+
+    def download(self, file, slack_token):
+        request = urllib.request.Request(file['url'], headers={'Authorization': 'Bearer ' + slack_token})
+        with self.opener.open(request, timeout=15) as response:
+            raw = response.read(10 * 1024 * 1024 + 1)
+        if len(raw) > 10 * 1024 * 1024 or len(raw) != file['size']:
+            raise RosterHeld('attachment_download_invalid')
+        return file['name'], raw
+
+
+def mirror_parts(row, cfg):
+    data = json.loads(row['data'])
+    text = html.unescape(data['text'])
+    text = re.sub(r'<@([A-Z0-9]+)(?:\|[^>]+)?>', r'@\1', text)
+    text = re.sub(r'<#[A-Z0-9]+\|([^>]+)>', r'#\1', text)
+    text = re.sub(r'<!(?:here|channel|everyone)>', '@channel', text)
+    text = re.sub(r'<(https?://[^>|]+)\|([^>]+)>', r'\2 (\1)', text)
+    text = re.sub(r'<(https?://[^>]+)>', r'\1', text)
+    link = 'https://app.slack.com/archives/' + row['channel'] + '/p' + row['ts'].replace('.', '')
+    header = data['author'] + ' · Slack\n'
+    if data['thread'] != row['ts']:
+        header += '[Thread ' + data['thread'] + ']\n'
+    # UTF-16 units, rather than Python characters, match Discord's content limit.
+    chunks, chunk, units = [], '', 0
+    for char in text or '[Attachment / empty message]':
+        width = len(char.encode('utf-16-le')) // 2
+        if units + width > 1600:
+            chunks.append(chunk);chunk, units = '', 0
+        chunk += char;units += width
+    chunks.append(chunk)
+    # Bound each upload request to 10 files / 10 MiB; extra batches are durable parts.
+    groups, group, size = [], [], 0
+    for file in data['files']:
+        if group and (len(group) == 10 or size + file['size'] > 10 * 1024 * 1024):
+            groups.append(group);group, size = [], 0
+        group.append(file);size += file['size']
+    if group:groups.append(group)
+    result = []
+    for i in range(max(len(chunks), len(groups))):
+        part = {'content': header + (chunks[i] if i < len(chunks) else '[Attachments continued]') + '\n' + link,
+                'files': groups[i] if i < len(groups) else []}
+        part['digest'] = hashlib.sha256(json.dumps(part, sort_keys=True).encode()).hexdigest()
+        result.append(part)
+    return result
+
+
+def process_mirror_one(store, policy, slack, discord, clock=None):
+    clock = clock or time.time
+    row = store.claim(clock())
+    if row is None:return False
+    cfg = store.cfg
+    route = cfg.routes[row['channel']]
+    parts = store.parts(row)
+    desired = [] if row['deleted'] else mirror_parts(row, cfg)
+    # Only ordinary, mapped channels. Reuse the established membership/shared-workspace guard.
+    scoped = dataclasses.replace(policy, channels=tuple(cfg.routes), channel_mode='explicit', group_dm_ids=())
+    try:
+        permission, delay = slack.conversation_allowed(scoped, row['channel'])
+        if permission != 'allowed':
+            store.finish(row, 'queued' if permission == 'retry' else 'failed', clock() + (delay or 30) if permission == 'retry' else 0)
+            return True
+        state, info = slack.call('conversations.info', {'channel': row['channel']})
+        if state != 'sent':raise RosterHeld('slack_route_read_unavailable')
+        if info.get('channel', {}).get('name') != route['name'] or info['channel'].get('is_mpim'):
+            store.finish(row, 'failed');return True
+        if not discord.allowed(route['discord'], route['name'], uploads=any(p['files'] for p in desired)):
+            store.finish(row, 'failed');return True
+    except Exception:
+        store.finish(row, 'queued', clock() + 30);return True
+    by_index = {p['part']: p for p in parts}
+    operation = None
+    # Delete surplus parts before updates, including multipart shrink and full deletion.
+    for p in reversed(parts):
+        if p['part'] >= len(desired) and p['state'] != 'deleted':
+            operation = ('DELETE', p['part'], p, None);break
+    if operation is None:
+        for index, target_part in enumerate(desired):
+            p = by_index.get(index)
+            if p is None or p['state'] == 'deleted' or p['digest'] != target_part['digest']:
+                operation = ('PATCH' if p and p['discord_id'] and p['state'] != 'deleted' else 'POST', index, p, target_part);break
+    if operation is None:
+        store.finish(row, 'clean');return True
+    method, index, old, target_part = operation
+    ident = old['discord_id'] if old else None
+    digest = target_part['digest'] if target_part else ''
+    if method == 'DELETE' and ident is None:
+        # A definitive rejection/429 never created a Discord object.
+        store.written(row, index, None, '', 'deleted')
+        store.finish(row, 'queued');return True
+    path = '/channels/' + route['discord'] + '/messages' + ('/' + ident if method != 'POST' else '')
+    body, files = None, []
+    if target_part:
+        body = {'content': target_part['content'], 'allowed_mentions': {'parse': [], 'users': [], 'roles': [], 'replied_user': False},
+                'flags': 4, 'attachments': []}
+        if method == 'POST':
+            body.update(nonce=hashlib.sha256((policy.team + ':' + row['channel'] + ':' + row['ts'] + ':'
+                                            + str(index) + ':' + str(row['generation'])).encode()).hexdigest()[:24], enforce_nonce=True)
+        try:
+            files = [discord.download(f, slack.token) for f in target_part['files']]
+            body['attachments'] = [{'id': i, 'filename': f[0]} for i, f in enumerate(files)]
+        except Exception:
+            store.finish(row, 'queued', clock() + 30);return True
+    store.begin_write(row, index, ident, digest)
+    try:
+        state, value = discord.call(method, path, body, files)
+    except Exception:
+        state, value = 'uncertain', None
+    if state == 'sent':
+        if method != 'DELETE':
+            ident = value.get('id')
+            if (not isinstance(ident, str) or not SNOWFLAKE.fullmatch(ident)
+                    or value.get('channel_id') != route['discord'] or value.get('author', {}).get('id') != cfg.bot_user):
+                state = 'uncertain'
+        if state == 'sent':
+            store.written(row, index, ident, digest, 'deleted' if method == 'DELETE' else 'sent')
+            store.finish(row, 'queued');return True
+    if state == 'rate_limited':
+        store.written(row, index, old['discord_id'] if old else None, old['digest'] if old else None, old['state'] if old else 'pending')
+        store.finish(row, 'queued', clock() + value)
+    elif state == 'failed':
+        store.written(row, index, ident, old['digest'] if old else None, 'failed')
+        store.finish(row, 'failed')
+    else:
+        store.written(row, index, ident, digest, 'uncertain')
+        store.finish(row, 'uncertain')
+    return True
 
 
 def listen_address():
@@ -566,6 +1004,8 @@ def main():
         raise SystemExit("Slack identity validation failed")
     stop = threading.Event()
     health = {"authenticated": True, "worker": time.monotonic()}
+    mirror_cfg = MirrorConfig.load()
+    mirror = MirrorStore(cfg.database, mirror_cfg, cfg, recover=False) if mirror_cfg else None
     monitor = None
     if cfg.roster_mode == "fresh_sheet":
         health["roster"] = {"status": "not_read", "member_count": 0}
@@ -584,7 +1024,7 @@ def main():
             stop.wait(1.1)  # one worker; no more than one post per second
 
     # Only one service instance may own this database (enforced by systemd deployment).
-    server = http.server.ThreadingHTTPServer(listen_address(), handler(cfg, store, health))
+    server = http.server.ThreadingHTTPServer(listen_address(), handler(cfg, store, health, mirror=mirror))
     server.daemon_threads = True
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
