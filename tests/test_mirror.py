@@ -36,25 +36,42 @@ def message(text='hello', *, eid='Ev01', ts='1793091836.135859', version=None, k
 
 class SlackFake:
     token = 'fixture'
-    def __init__(self):self.permission, self.name = 'allowed', 'general'
+    workspace_url = 'https://example.slack.com/'
+    def __init__(self):self.permission, self.name, self.calls, self.profile_ok, self.roots = 'allowed', 'general', [], True, {}
     def conversation_allowed(self, cfg, channel):return self.permission, 30
-    def call(self, method, body):return 'sent', {'channel': {'name': self.name}}
+    def call(self, method, body):
+        self.calls.append((method,body))
+        if method=='users.info':
+            return ('sent',{'user':{'id':body['user'],'profile':{'display_name':'Alice'}}}) if self.profile_ok else ('failed',None)
+        if method=='conversations.history':
+            value=self.roots.get(body['oldest'])
+            return 'sent',{'messages':[value] if value else []}
+        return 'sent', {'channel': {'name': self.name}}
 
 
 class DiscordFake:
     def __init__(self):
-        self.calls, self.allowed_result, self.results, self.checks = [], True, [], []
+        self.calls, self.allowed_result, self.results, self.checks, self.threads = [], True, [], [], {}
     def allowed(self, *args, **kwargs):
         self.checks.append((args, kwargs));return self.allowed_result
     def download(self, file, token):return file['name'], b'x' * file['size']
     def call(self, method, path, body=None, files=None):
         self.calls.append((method, path, copy.deepcopy(body), files))
+        if method=='GET':return ('sent',self.threads[path.split('/')[-1]]) if path.split('/')[-1] in self.threads else ('missing',None)
         if self.results:
             result = self.results.pop(0)
             if isinstance(result, Exception):raise result
             return result
+        if path.endswith('/threads'):
+            ident=path.split('/')[-2]
+            value={'id':ident,'guild_id':GUILD,'parent_id':DEST,'type':11,'thread_metadata':{'archived':False,'locked':False}}
+            self.threads[ident]=value
+            return 'sent',copy.deepcopy(value)
+        if method=='PATCH' and '/messages' not in path:
+            ident=path.split('/')[-1];self.threads[ident]['thread_metadata'].update(body)
+            return 'sent',copy.deepcopy(self.threads[ident])
         ident = path.split('/')[-1] if method != 'POST' else str(600000000000000000 + len(self.calls))
-        return 'sent', {'id': ident, 'channel_id': DEST, 'author': {'id': BOT}}
+        return 'sent', {'id': ident, 'channel_id': path.split('/')[2], 'author': {'id': BOT}}
 
 
 class MirrorTests(unittest.TestCase):
@@ -72,8 +89,8 @@ class MirrorTests(unittest.TestCase):
         return process_mirror_one(self.store, self.policy, self.slack, self.discord, lambda: now)
 
     def drain(self):
-        for _ in range(30):
-            if not self.step(now=2100000000):return
+        for index in range(50):
+            if not self.step(now=2100000000+index*60):return
         self.fail('mirror did not drain')
 
     def enqueue(self, *args, **kwargs):self.store.enqueue(message(*args, **kwargs))
@@ -146,7 +163,8 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual(self.store.counts(), {'uncertain': 1})
         self.enqueue(eid='EvOther', ts='1793091840.000000')
         row = self.store.claim(2000000000)
-        part = mirror_parts(row, self.cfg)[0]
+        row = self.store.resolve_author(row,self.slack,2000000000)
+        part = mirror_parts(row, self.cfg,workspace_url=self.slack.workspace_url)[0]
         self.store.begin_write(row, 0, None, part['digest'])
         self.store.written(row, 0, '666666666666666666', part['digest'])
         self.store = MirrorStore(self.policy.database, self.cfg, self.policy);self.drain()
@@ -228,8 +246,8 @@ class MirrorTests(unittest.TestCase):
         p = message('<@U00000003> <!here> <https://example.com|link>')
         p['event'].update(subtype='bot_message', bot_id='B00000001', thread_ts='1793091800.000000')
         self.store.enqueue(p);self.drain()
-        text = self.discord.calls[-1][2]['content']
-        self.assertIn('[Thread 1793091800.000000]', text)
+        text = next(c[2]['content'] for c in reversed(self.discord.calls) if c[2] and 'content' in c[2])
+        self.assertIn('[Alice](https://example.slack.com/team/U00000003)', text)
         self.assertIn('@U00000003', text)
         self.assertNotIn('<@', text)
 

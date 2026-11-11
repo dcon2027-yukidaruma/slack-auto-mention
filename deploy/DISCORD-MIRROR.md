@@ -42,6 +42,9 @@ manifest and a rollback release. Updating ingress does not self-update the host 
    each text channel by exact, unique name to a Slack source. Report missing or
    ambiguous matches. Never guess names, create channels or broaden permissions.
    Verify `VIEW_CHANNEL`, `SEND_MESSAGES`, and `ATTACH_FILES` for attachments.
+   Native replies also require `CREATE_PUBLIC_THREADS` and
+   `SEND_MESSAGES_IN_THREADS`. Missing permissions hold replies; they never
+   silently flatten into the channel or grant new permissions.
    Own-message edits/deletes do not require `MANAGE_MESSAGES`.
 4. Persist only the nonsecret verified route IDs/names and an activation `since`
    Unix second. Set `DISCORD_MIRROR_CONFIG` to JSON inside the existing private
@@ -66,11 +69,38 @@ Human messages, bot/integration messages, thread replies and textual system
 messages are accepted. Thread-broadcast duplicates share their original Slack
 timestamp. Thread metadata updates are ignored. Edits use `message.ts`; deletes
 use `deleted_ts`, including tombstones. Only source timestamps at or after the
-activation boundary are eligible; edits to older unmirrored posts do not backfill.
+activation boundary are eligible. When a new reply refers to an unmirrored parent,
+only that exact parent is normalized from Slack's supplied root snapshot or read
+with `conversations.history` (`oldest=latest=thread_ts`, inclusive, limit 1).
+No paging or historical reply replay is performed. The targeted parent becomes a
+tracked context message, so later live edits/deletes can update that one copy.
+An unavailable parent gets an explicit context placeholder rather than an
+unrelated history item. Other old unmirrored messages remain ineligible.
 
-Each post includes the Slack author ID (or supplied bot name), thread timestamp
-when applicable, message text and source link. It posts in the mapped text
-channel rather than creating Discord threads. Long text is split below Discord's
+Each post displays the sender's name as a clickable Slack profile link, message
+text and a source link. The profile URL uses only the workspace origin returned
+by authenticated `auth.test` and that sender's validated Slack user ID. Discord
+masked-link labels escape brackets, parentheses and backslashes; no ID suffix is
+displayed. Supplied Slack profile names are preferred; otherwise `users.info`
+uses the existing bot token when `users:read` is available. Only display
+names/IDs/timestamps are cached, bounded to 2000 entries, with no email lookup or
+credential fallback. A missing profile scope/name uses the linked label
+`Slack user` and does not drop the message; report that limit rather than claim
+all names resolved. System messages without a valid user ID remain plain names.
+
+Top-level posts go to the mapped text channel. Replies go to the public Discord
+thread attached to the recorded first part of their parent. The thread has the
+same ID as that starter message and is recorded in `mirror_threads`. Subsequent
+replies reuse it, including after restarts. Slack `thread_broadcast` / "also send
+to channel" replies have both a thread copy and a channel copy. The broadcast
+flag is retained across out-of-order pointers, duplicates and edits. Each copy
+has its own destination, receipt and nonce in `mirror_copies`; edits/deletes
+cover every copy and every text/file part. The worker never issues a whole-thread
+delete when its parent is removed, because it may contain other replies or human messages.
+
+Automatic archive is reopened before edits; moderator-locked or manually deleted
+threads hold work without creating another thread or using a flat fallback.
+Long text is split below Discord's
 2000-character limit, accounting for UTF-16 units. Edits can grow/shrink the parts;
 deletion removes all recorded parts, including after restart.
 
@@ -81,7 +111,7 @@ unavailable URLs get an explicit omission notice; text still forwards. Files
 without a usable Slack URL cannot be copied. Interactive Block Kit controls,
 reactions, canvases, custom emoji assets and Slack-specific rich formatting are
 not recreated. Block/attachment text fallbacks are retained where available.
-Slack profile lookups requiring a new scope are not performed.
+No OAuth scope or Discord permission is granted automatically.
 
 All POST/PATCH requests explicitly suppress user, role and everyone mentions;
 embeds are suppressed. Source content cannot select a route, credential or API
@@ -97,6 +127,9 @@ success or a crash during an HTTP write become `uncertain`, with no automatic
 POST replay or fallback. A lost create response may therefore leave an unlinked
 Discord message; human reconciliation is required. Later source events do not
 clear that state. Definitive permission/name/identity failures become `failed`.
+Thread creation is reconciled by a read of its deterministic starter-message ID;
+an unknown create is never followed by a second create POST. A rate-limit
+rejection can retry, and an idempotent unarchive is re-read before any next attempt.
 Verification/download outages queue work for a later retry. Monitor these counts;
 the system does not claim exactly-once delivery or a real-time SLA.
 
@@ -112,6 +145,28 @@ safe procedure, then stop the mirror service. Retain all mirror receipt tables.
 Rollback code/config only after both processes have stopped; never roll back
 SQLite to stale receipts. The original mention and Projects services retain
 their existing code, credentials, recipients and delivery ledgers.
+
+## Upgrade from flat forwarding
+
+Pause the existing CD timer and wait for the CD deploy lock before upgrading.
+Create the private nonsecret `mirror-worker.pause` marker, stop the old host
+worker gracefully, and take a SQLite backup. Install the exact tested new worker
+source and start it with the marker present. This is the only owner of schema
+recovery and copy-receipt migration; never let an old worker write v1 receipts
+after the new worker has seeded `mirror_copies`.
+
+The new worker initializes its tables and heartbeat while paused. Ingress remains
+available and commits new callbacks. Promote the exact CI-eligible main image,
+verify ingress/worker code hashes agree, and remove only the deployment-owned
+pause marker. Confirm `worker_paused=false`, health, original mention receipts,
+all old mirror IDs and held/uncertain states, then resume the CD timer.
+
+Existing `mirror_parts` rows are retained and copied once into channel-lane
+receipts. Clean old messages are not queued or relocated. Queued v1 payloads keep
+their flat placement; new v2 callbacks use native threads. A future edit to an old
+reply can move its known copy into its parent thread. Never restore a stale DB or
+downgrade to a v1 host worker after v2 thread/copy writes: it cannot see those new
+receipts. Hold the mirror and reconcile or fix forward if promotion fails.
 
 Reference: [Slack edits](https://docs.slack.dev/reference/events/message/message_changed/),
 [Slack deletes](https://docs.slack.dev/reference/events/message/message_deleted/),

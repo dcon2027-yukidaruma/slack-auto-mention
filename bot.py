@@ -323,7 +323,7 @@ class Slack:
     def call(self, method, body):
         headers = {"Authorization": "Bearer " + self.token}
         url = "https://slack.com/api/" + method
-        if method in ("conversations.info", "conversations.members", "conversations.list"):
+        if method in ("conversations.info", "conversations.members", "conversations.list", "conversations.history", "users.info"):
             request = urllib.request.Request(url + "?" + urllib.parse.urlencode(body), headers=headers)
         else:
             headers["Content-Type"] = "application/json; charset=utf-8"
@@ -509,7 +509,8 @@ def handler(cfg, store, health, *, mirror=None):
             self.reply(200 if ready else 503, {"ready": ready, "revision": os.getenv("APP_REVISION", "unknown"),
                                              "events": counts,
                                              **({"mirror": {"events": mirror.counts(),
-                                                  "worker_alive": mirror.worker_alive(time.time())}}
+                                                  "worker_alive": mirror.worker_alive(time.time()),
+                                                  "worker_paused": mirror.worker_paused()}}
                                                 if mirror else {}),
                                              **({"roster": health.get("roster", {"status": "not_read"})}
                                                 if cfg.roster_mode == "fresh_sheet" else {})})
@@ -597,13 +598,17 @@ class MirrorConfig:
                                    group_dm_ids=(), shared_channel_ids=self.shared_channels)
 
 
-def mirror_event(payload, cfg, policy):
+def clean_mirror_name(value):
+    return re.sub(r'[\r\n`*_<>@]', '', value).strip()[:100] if isinstance(value,str) else ''
+
+
+def mirror_event(payload, cfg, policy, *, existing=False):
     """Only authenticated callbacks reach this function. Keep source text inert."""
     if (not policy.enabled or not isinstance(payload, dict) or payload.get('type') != 'event_callback'
             or payload.get('team_id') != policy.team):
         return None
     e = payload.get('event')
-    if not isinstance(e, dict) or e.get('type') != 'message' or e.get('channel') not in cfg.routes:
+    if not isinstance(e, dict) or e.get('type') != 'message' or not isinstance(e.get('channel'),str) or e.get('channel') not in cfg.routes:
         return None
     if e.get('team', policy.team) != policy.team or (payload.get('is_ext_shared_channel')
             and e['channel'] not in cfg.shared_channels):
@@ -625,7 +630,7 @@ def mirror_event(payload, cfg, policy):
     ts = message.get('ts')
     version = e.get('event_ts', e.get('ts', ts))
     if (not all(isinstance(v, str) and re.fullmatch(r'[0-9]{10}\.[0-9]{6}', v) for v in (ts, version))
-            or int(ts.split('.')[0]) < cfg.since):
+            or (int(ts.split('.')[0]) < cfg.since and not existing)):
         return None  # No backfill and no mirroring edits to old, unmirrored messages.
     thread = message.get('thread_ts', ts)
     if not isinstance(thread, str) or not re.fullmatch(r'[0-9]{10}\.[0-9]{6}', thread):
@@ -672,14 +677,38 @@ def mirror_event(payload, cfg, policy):
                 text += '\n[Attachment unavailable for automatic upload: ' + name[:100] + ']'
     profile = message.get('user_profile')
     display = (profile.get('display_name') or profile.get('real_name')) if isinstance(profile, dict) else None
-    author = display or message.get('user') or message.get('username') or message.get('bot_id') or 'Slack'
+    bot_profile = message.get('bot_profile')
+    bot_name = bot_profile.get('name') if isinstance(bot_profile, dict) else None
+    author_id = message.get('user') or (bot_profile.get('user_id') if isinstance(bot_profile, dict) else None)
+    if not isinstance(author_id, str) or not re.fullmatch(r'U[A-Z0-9]{8,}', author_id):author_id = ''
+    supplied_name = display or message.get('username') or bot_name or ''
+    author = supplied_name or author_id or message.get('bot_id') or 'Slack'
     author = re.sub(r'[\r\n`*_<>@]', '', str(author))[:100]
-    data = {'text': text, 'files': files, 'author': author, 'thread': thread}
+    data = {'text': text, 'files': files, 'author': author, 'thread': thread,
+            'schema': 2, 'author_id': author_id, 'author_name': clean_mirror_name(supplied_name),
+            'thread_explicit': 'thread_ts' in message,
+            'broadcast': subtype == 'thread_broadcast' or message.get('subtype') == 'thread_broadcast'
+                         or message.get('reply_broadcast') is True,
+            'reference_only': subtype == 'thread_broadcast'}
+    root = message.get('root') or e.get('root')
+    if isinstance(root,dict) and root.get('ts') == thread and thread != ts:
+        normalized = mirror_context(root,e['channel'],thread,cfg,policy)
+        if normalized:data['root_data'] = normalized
     if len(json.dumps(data).encode()) > 512 * 1024:
         raise ValueError('Mirror message exceeds durable bounds')
     return {'event_id': eid, 'channel': e['channel'], 'ts': ts,
             'version': int(version.replace('.', '')), 'deleted': deleted,
             'create': subtype not in ('message_changed', 'message_deleted'), 'data': data}
+
+
+def mirror_context(message,channel,ts,cfg,policy):
+    """Normalize one verified parent snapshot; this never requests a history page."""
+    if not isinstance(message,dict) or message.get('ts') != ts:return None
+    selected = {k:v for k,v in message.items() if k not in ('root','team')}
+    selected.update(type='message',channel=channel,thread_ts=ts)
+    item = mirror_event({'type':'event_callback','team_id':policy.team,'event_id':'EvThreadContext','event':selected},
+                        cfg,policy,existing=True)
+    return item['data'] if item and not item['deleted'] else None
 
 
 class MirrorStore(Store):
@@ -697,16 +726,38 @@ class MirrorStore(Store):
                 channel TEXT, ts TEXT, part INTEGER, discord_id TEXT, digest TEXT,
                 state TEXT NOT NULL, PRIMARY KEY(channel,ts,part))''')
             c.execute('CREATE TABLE IF NOT EXISTS mirror_control (name TEXT PRIMARY KEY, due REAL NOT NULL)')
+            # v1 receipts stay intact. Seed their channel copies once; never replay clean rows.
+            c.execute('''CREATE TABLE IF NOT EXISTS mirror_copies (
+                channel TEXT, ts TEXT, lane TEXT, part INTEGER, destination TEXT NOT NULL,
+                discord_id TEXT, digest TEXT, state TEXT NOT NULL,
+                PRIMARY KEY(channel,ts,lane,part))''')
+            for channel, route in cfg.routes.items():
+                c.execute("INSERT OR IGNORE INTO mirror_copies SELECT channel,ts,'channel',part,?,discord_id,digest,state "
+                          'FROM mirror_parts WHERE channel=?', (route['discord'], channel))
+            c.execute('''CREATE TABLE IF NOT EXISTS mirror_threads (
+                channel TEXT, root_ts TEXT, starter_id TEXT NOT NULL, thread_id TEXT,
+                state TEXT NOT NULL, PRIMARY KEY(channel,root_ts))''')
+            c.execute('CREATE TABLE IF NOT EXISTS mirror_authors (user_id TEXT PRIMARY KEY,name TEXT NOT NULL,checked REAL NOT NULL)')
             if recover:
                 # Only the independently locked worker owns crash recovery.
                 c.execute("UPDATE mirror_messages SET state='queued' WHERE state='working'")
                 c.execute("UPDATE mirror_parts SET state='uncertain' WHERE state='sending'")
+                c.execute("UPDATE mirror_copies SET state='uncertain' WHERE state='sending'")
+                c.execute("UPDATE mirror_threads SET state='uncertain' WHERE state='creating'")
                 c.execute("UPDATE mirror_messages SET state='uncertain' WHERE EXISTS (SELECT 1 FROM mirror_parts p "
                           "WHERE p.channel=mirror_messages.channel AND p.ts=mirror_messages.ts AND p.state='uncertain')")
+                c.execute("UPDATE mirror_messages SET state='uncertain' WHERE EXISTS (SELECT 1 FROM mirror_copies p "
+                          "WHERE p.channel=mirror_messages.channel AND p.ts=mirror_messages.ts AND p.state='uncertain')")
 
-    def heartbeat(self, now):
+    def heartbeat(self, now, *, paused=False):
         with self.connect() as c:
             c.execute("INSERT INTO mirror_control VALUES('worker',?) ON CONFLICT(name) DO UPDATE SET due=excluded.due", (now,))
+            c.execute("INSERT INTO mirror_control VALUES('paused',?) ON CONFLICT(name) DO UPDATE SET due=excluded.due", (int(paused),))
+
+    def worker_paused(self):
+        with self.connect() as c:
+            value=c.execute("SELECT due FROM mirror_control WHERE name='paused'").fetchone()
+            return bool(value and value[0])
 
     def worker_alive(self, now):
         with self.connect() as c:
@@ -714,7 +765,13 @@ class MirrorStore(Store):
             return bool(value and 0 <= now - value[0] < 300)
 
     def enqueue(self, payload):
-        item = mirror_event(payload, self.cfg, self.policy)
+        candidate = payload.get('event', {}) if isinstance(payload, dict) else {}
+        if not isinstance(candidate,dict):return
+        source = candidate.get('message', candidate) if isinstance(candidate, dict) else {}
+        ts = candidate.get('deleted_ts') if candidate.get('subtype') == 'message_deleted' else source.get('ts') if isinstance(source, dict) else None
+        with self.connect() as c:
+            existing = c.execute('SELECT 1 FROM mirror_messages WHERE channel=? AND ts=?', (candidate.get('channel'), ts)).fetchone() if isinstance(candidate.get('channel'),str) and isinstance(ts,str) else None
+        item = mirror_event(payload, self.cfg, self.policy, existing=bool(existing))
         if item is None:return
         with self.connect() as c:
             c.execute('BEGIN IMMEDIATE')
@@ -725,9 +782,28 @@ class MirrorStore(Store):
                 # Deletion is permanent. Delayed creates cannot overwrite newer edits.
                 if row['deleted'] or row['state'] == 'uncertain' or row['config_hash'] != self.cfg.fingerprint:return
                 create_seen = row['create_seen'] or item['create']
+                previous = json.loads(row['data'])
+                item['data']['broadcast'] = bool(previous.get('broadcast') or item['data']['broadcast'])
+                if item['data'].get('reference_only') and not previous.get('reference_only'):
+                    if not item['data']['files']:item['data']['files'] = previous.get('files',[])
+                    if not item['data']['text']:item['data']['text'] = previous.get('text','')
+                    item['data']['reference_only'] = False
+                if previous.get('reference_only') and not item['data'].get('reference_only'):
+                    item['version'] = max(item['version'],row['version'])
+                if not item['data']['thread_explicit']:item['data']['thread'] = previous['thread']
+                if not item['data']['author_id']:item['data']['author_id'] = previous.get('author_id', '')
+                if not item['data']['author_name']:item['data']['author_name'] = previous.get('author_name', '')
+                if 'root_data' not in item['data'] and 'root_data' in previous:item['data']['root_data']=previous['root_data']
+                if len(json.dumps(item['data']).encode())>512*1024:item['data'].pop('root_data',None)
                 if item['version'] < row['version'] and not item['deleted']:
-                    c.execute('UPDATE mirror_messages SET create_seen=? WHERE channel=? AND ts=?',
-                              (int(create_seen), item['channel'], item['ts']))
+                    if item['data']['broadcast'] and not previous.get('broadcast'):
+                        previous['broadcast'] = True
+                        previous['schema'] = item['data']['schema']
+                        c.execute("UPDATE mirror_messages SET data=?,generation=generation+1,create_seen=?,state=CASE WHEN state='working' THEN state ELSE 'queued' END "
+                                  'WHERE channel=? AND ts=?', (json.dumps(previous),int(create_seen),item['channel'],item['ts']))
+                    else:
+                        c.execute('UPDATE mirror_messages SET create_seen=? WHERE channel=? AND ts=?',
+                                  (int(create_seen), item['channel'], item['ts']))
                     return
                 c.execute('UPDATE mirror_messages SET version=?,generation=generation+1,data=?,create_seen=?,deleted=?,state=?,attempts=0 '
                           'WHERE channel=? AND ts=?', (item['version'], json.dumps(item['data']), int(create_seen),
@@ -743,7 +819,7 @@ class MirrorStore(Store):
             gate = c.execute("SELECT due FROM mirror_control WHERE name='discord'").fetchone()
             if gate and gate[0] > now:return None
             row = c.execute("SELECT * FROM mirror_messages WHERE state='queued' AND due<=? "
-                            "AND (create_seen=1 OR deleted=1) ORDER BY rowid LIMIT 1", (now,)).fetchone()
+                            "AND (create_seen=1 OR deleted=1) ORDER BY due,rowid LIMIT 1", (now,)).fetchone()
             if row:
                 valid = self.policy.enabled and row['config_hash'] == self.cfg.fingerprint
                 c.execute('UPDATE mirror_messages SET state=?,attempts=attempts+1 WHERE channel=? AND ts=?',
@@ -752,25 +828,62 @@ class MirrorStore(Store):
 
     def parts(self, row):
         with self.connect() as c:
-            return list(c.execute('SELECT * FROM mirror_parts WHERE channel=? AND ts=? ORDER BY part', (row['channel'], row['ts'])))
+            return list(c.execute('SELECT * FROM mirror_copies WHERE channel=? AND ts=? ORDER BY lane,part', (row['channel'], row['ts'])))
 
-    def finish(self, row, state, due=0):
+    def finish(self, row, state, due=0, *, cooldown=True):
         with self.connect() as c:
             # If another event arrived during HTTP, process its newer desired state next.
             c.execute("UPDATE mirror_messages SET state=CASE WHEN generation!=? AND ?='clean' THEN 'queued' ELSE ? END,due=? "
                       'WHERE channel=? AND ts=?', (row['generation'], state, state, due, row['channel'], row['ts']))
-            if due:
+            if due and cooldown:
                 c.execute("INSERT INTO mirror_control VALUES('discord',?) ON CONFLICT(name) DO UPDATE SET due=max(due,excluded.due)", (due,))
 
-    def begin_write(self, row, part, ident, digest):
+    def begin_write(self, row, part, ident, digest, *, lane='channel', destination=None):
         with self.connect() as c:
-            c.execute("INSERT INTO mirror_parts VALUES(?,?,?,?,?,'sending') ON CONFLICT(channel,ts,part) "
-                      "DO UPDATE SET state='sending'", (row['channel'], row['ts'], part, ident, digest))
+            c.execute("INSERT INTO mirror_copies VALUES(?,?,?,?,?,?,?,'sending') ON CONFLICT(channel,ts,lane,part) "
+                      "DO UPDATE SET state='sending'", (row['channel'], row['ts'], lane, part,
+                      destination or self.cfg.routes[row['channel']]['discord'], ident, digest))
 
-    def written(self, row, part, ident, digest, state='sent'):
+    def written(self, row, part, ident, digest, state='sent', *, lane='channel'):
         with self.connect() as c:
-            c.execute('UPDATE mirror_parts SET discord_id=?,digest=?,state=? WHERE channel=? AND ts=? AND part=?',
-                      (ident, digest, state, row['channel'], row['ts'], part))
+            c.execute('UPDATE mirror_copies SET discord_id=?,digest=?,state=? WHERE channel=? AND ts=? AND lane=? AND part=?',
+                      (ident, digest, state, row['channel'], row['ts'], lane, part))
+
+    def message(self, channel, ts):
+        with self.connect() as c:return c.execute('SELECT * FROM mirror_messages WHERE channel=? AND ts=?', (channel,ts)).fetchone()
+
+    def add_context(self, channel, ts, data):
+        with self.connect() as c:
+            c.execute("INSERT OR IGNORE INTO mirror_messages VALUES(?,?,?,1,?,?,1,0,'queued',0,0)",
+                      (channel,ts,int(ts.replace('.','')),self.cfg.fingerprint,json.dumps(data)))
+
+    def thread(self, channel, ts):
+        with self.connect() as c:return c.execute('SELECT * FROM mirror_threads WHERE channel=? AND root_ts=?', (channel,ts)).fetchone()
+
+    def thread_state(self, channel, ts, starter, state, thread_id=None):
+        with self.connect() as c:
+            c.execute('INSERT INTO mirror_threads VALUES(?,?,?,?,?) ON CONFLICT(channel,root_ts) DO UPDATE SET thread_id=excluded.thread_id,state=excluded.state',
+                      (channel,ts,starter,thread_id,state))
+
+    def resolve_author(self, row, slack, now):
+        data = json.loads(row['data'])
+        ident = data.get('author_id') or (data.get('author') if re.fullmatch(r'U[A-Z0-9]{8,}', data.get('author','')) else '')
+        if not ident or data.get('author_name'):return row
+        with self.connect() as c:cached = c.execute('SELECT * FROM mirror_authors WHERE user_id=?', (ident,)).fetchone()
+        name = cached['name'] if cached else ''
+        if cached is None or now-cached['checked'] > (86400 if name else 300):
+            status, value = slack.call('users.info', {'user':ident})
+            if status == 'sent' and isinstance(value.get('user'),dict) and value['user'].get('id') == ident:
+                profile = value['user'].get('profile',{})
+                name = clean_mirror_name(profile.get('display_name') or profile.get('real_name') or value['user'].get('name')) or name
+            with self.connect() as c:
+                c.execute('INSERT INTO mirror_authors VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET name=excluded.name,checked=excluded.checked', (ident,name,now))
+                c.execute('DELETE FROM mirror_authors WHERE user_id IN (SELECT user_id FROM mirror_authors ORDER BY checked DESC LIMIT -1 OFFSET 2000)')
+        data.update(author_id=ident,author_name=name)
+        with self.connect() as c:
+            c.execute('UPDATE mirror_messages SET data=? WHERE channel=? AND ts=? AND generation=?',
+                      (json.dumps(data),row['channel'],row['ts'],row['generation']))
+        return dict(row,data=json.dumps(data))
 
     def counts(self):
         with self.connect() as c:
@@ -818,11 +931,12 @@ class DiscordMirror:
                 except (ValueError, TypeError, AttributeError):pass
                 return 'failed', None
             if error.code == 404 and method == 'DELETE':return 'sent', {}
+            if error.code == 404 and method == 'GET':return 'missing', None
             return ('failed', None) if 400 <= error.code < 500 else ('uncertain', None)
         except (OSError, ValueError):
             return 'uncertain', None
 
-    def allowed(self, channel, name, *, uploads=False):
+    def allowed(self, channel, name, *, uploads=False, thread=None, create_thread=False):
         """Verify identity, guild/category/name and effective channel permissions each time."""
         def get(path):
             state, data = self.call('GET', path)
@@ -856,8 +970,12 @@ class DiscordMirror:
             for overwrite in overrides:
                 if overwrite.get('type') == 1 and overwrite.get('id') == cfg.bot_user:
                     permissions = (permissions & ~int(overwrite['deny'])) | int(overwrite['allow'])
-            required = (1 << 10) | (1 << 11) | ((1 << 15) if uploads else 0)
+            required = (1 << 10) | ((1 << 38) if thread or create_thread else (1 << 11)) | ((1 << 15) if uploads else 0)
+            if create_thread:required |= 1 << 35
             if permissions & required != required:return False
+        if thread:
+            data = get('/channels/' + thread)
+            if not valid_mirror_thread(data,cfg,channel,thread):return False
         return member.get('user', {}).get('id') == cfg.bot_user and not member.get('communication_disabled_until')
 
     def download(self, file, slack_token):
@@ -869,7 +987,7 @@ class DiscordMirror:
         return file['name'], raw
 
 
-def mirror_parts(row, cfg):
+def mirror_parts(row, cfg, *, workspace_url=''):
     data = json.loads(row['data'])
     text = html.unescape(data['text'])
     text = re.sub(r'<@([A-Z0-9]+)(?:\|[^>]+)?>', r'@\1', text)
@@ -878,14 +996,23 @@ def mirror_parts(row, cfg):
     text = re.sub(r'<(https?://[^>|]+)\|([^>]+)>', r'\2 (\1)', text)
     text = re.sub(r'<(https?://[^>]+)>', r'\1', text)
     link = 'https://app.slack.com/archives/' + row['channel'] + '/p' + row['ts'].replace('.', '')
-    header = data['author'] + ' · Slack\n'
-    if data['thread'] != row['ts']:
-        header += '[Thread ' + data['thread'] + ']\n'
+    ident = data.get('author_id') or (data.get('author') if re.fullmatch(r'U[A-Z0-9]{8,}',data.get('author','')) else '')
+    name = data.get('author_name') or (data.get('author') if data.get('author') != ident else '') or 'Slack user'
+    name = clean_mirror_name(name) or 'Slack user'
+    # Only the workspace origin returned by authenticated auth.test is trusted.
+    # Message-supplied names/URLs cannot choose the destination or break the label.
+    if (isinstance(workspace_url,str) and re.fullmatch(r'https://[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.slack\.com/',workspace_url)
+            and isinstance(ident,str) and re.fullmatch(r'U[A-Z0-9]{8,}',ident)):
+        label = re.sub(r'([\\\[\]()])', r'\\\1', name)
+        name = '[' + label + '](' + workspace_url + 'team/' + ident + ')'
+    header = name + ' · Slack\n'
     # UTF-16 units, rather than Python characters, match Discord's content limit.
     chunks, chunk, units = [], '', 0
+    budget = min(1600,2000-len((header+'\n'+link).encode('utf-16-le'))//2)
+    if budget < 100:raise ValueError('Mirror header exceeds bounds')
     for char in text or '[Attachment / empty message]':
         width = len(char.encode('utf-16-le')) // 2
-        if units + width > 1600:
+        if units + width > budget:
             chunks.append(chunk);chunk, units = '', 0
         chunk += char;units += width
     chunks.append(chunk)
@@ -905,6 +1032,72 @@ def mirror_parts(row, cfg):
     return result
 
 
+def valid_mirror_thread(data,cfg,parent,ident):
+    return (isinstance(data,dict) and data.get('id') == ident and data.get('guild_id') == cfg.guild
+            and data.get('parent_id') == parent and data.get('type') == 11)
+
+
+def ensure_mirror_thread(store,row,policy,slack,discord):
+    """One thread per recorded starter ID; unknown creates never trigger another POST."""
+    cfg=store.cfg;route=cfg.routes[row['channel']];data=json.loads(row['data']);root_ts=data['thread']
+    ledger=store.thread(row['channel'],root_ts)
+    starter=ledger['starter_id'] if ledger else None
+    if starter is None:
+        root=store.message(row['channel'],root_ts)
+        if root is None:
+            context=data.get('root_data')
+            if context is None:
+                state,value=slack.call('conversations.history',{'channel':row['channel'],'oldest':root_ts,
+                                      'latest':root_ts,'inclusive':'true','limit':1})
+                if state == 'rate_limited':return 'rate_limited',value
+                if state not in ('sent','failed'):return 'retry',None
+                messages=value.get('messages',[]) if state == 'sent' and isinstance(value,dict) else []
+                context=mirror_context(messages[0],row['channel'],root_ts,cfg,policy) if len(messages)==1 else None
+            if context is None:
+                context={'schema':2,'text':'[Slack parent message unavailable]','files':[], 'author':'Slack',
+                         'author_name':'Slack','author_id':'','thread':root_ts,'broadcast':False,'thread_explicit':True}
+            store.add_context(row['channel'],root_ts,context)
+            return 'wait',None
+        if root['deleted'] or root['state'] in ('uncertain','failed'):return 'blocked',None
+        posted=next((p for p in store.parts(root) if p['lane']=='channel' and p['part']==0
+                     and p['state']=='sent' and p['discord_id']),None)
+        if posted is None:return 'wait',None
+        starter=posted['discord_id']
+        if not isinstance(starter,str) or not SNOWFLAKE.fullmatch(starter):return 'blocked',None
+    status,info=discord.call('GET','/channels/'+starter)
+    if status == 'rate_limited':return status,info
+    if status == 'sent':
+        if not valid_mirror_thread(info,cfg,route['discord'],starter):return 'blocked',None
+        if info.get('thread_metadata',{}).get('locked'):return 'blocked',None
+        store.thread_state(row['channel'],root_ts,starter,'ready',starter)
+        if info.get('thread_metadata',{}).get('archived'):
+            status,value=discord.call('PATCH','/channels/'+starter,{'archived':False})
+            if status=='rate_limited':return status,value
+            if status!='sent':return 'retry',None  # Re-read the idempotent state before another attempt.
+            if not valid_mirror_thread(value,cfg,route['discord'],starter):return 'blocked',None
+            return 'changed',starter
+        return 'ready',starter
+    if status != 'missing':return 'retry',None
+    if ledger and ledger['state'] in ('uncertain','creating','ready'):return 'uncertain',None
+    if not discord.allowed(route['discord'],route['name'],create_thread=True):return 'blocked',None
+    root=store.message(row['channel'],root_ts)
+    title=clean_mirror_name(re.sub(r'\s+',' ',json.loads(root['data'])['text']))[:80] or 'Slack thread'
+    store.thread_state(row['channel'],root_ts,starter,'creating')
+    try:status,value=discord.call('POST','/channels/'+route['discord']+'/messages/'+starter+'/threads',
+                                {'name':title,'auto_archive_duration':1440})
+    except Exception:status,value='uncertain',None
+    if status == 'rate_limited':
+        store.thread_state(row['channel'],root_ts,starter,'pending');return status,value
+    if status=='sent' and valid_mirror_thread(value,cfg,route['discord'],starter):
+        store.thread_state(row['channel'],root_ts,starter,'ready',starter);return 'changed',starter
+    # Creating from a message has a deterministic ID, so readback can reconcile a lost response.
+    check,thread=discord.call('GET','/channels/'+starter)
+    if check=='sent' and valid_mirror_thread(thread,cfg,route['discord'],starter):
+        store.thread_state(row['channel'],root_ts,starter,'ready',starter);return 'changed',starter
+    store.thread_state(row['channel'],root_ts,starter,'failed' if status=='failed' else 'uncertain')
+    return ('blocked' if status=='failed' else 'uncertain'),None
+
+
 def process_mirror_one(store, policy, slack, discord, clock=None):
     clock = clock or time.time
     row = store.claim(clock())
@@ -912,7 +1105,7 @@ def process_mirror_one(store, policy, slack, discord, clock=None):
     cfg = store.cfg
     route = cfg.routes[row['channel']]
     parts = store.parts(row)
-    desired = [] if row['deleted'] else mirror_parts(row, cfg)
+    desired = []
     # Only ordinary, mapped channels. Reuse the established membership/shared-workspace guard.
     scoped = cfg.source_policy(policy)
     try:
@@ -924,44 +1117,77 @@ def process_mirror_one(store, policy, slack, discord, clock=None):
         if state != 'sent':raise RosterHeld('slack_route_read_unavailable')
         if info.get('channel', {}).get('name') != route['name'] or info['channel'].get('is_mpim'):
             store.finish(row, 'failed');return True
+        if not row['deleted']:
+            row=store.resolve_author(row,slack,clock())
+            desired=mirror_parts(row,cfg,workspace_url=getattr(slack,'workspace_url',''))
         if not discord.allowed(route['discord'], route['name'], uploads=any(p['files'] for p in desired)):
             store.finish(row, 'failed');return True
     except Exception:
         store.finish(row, 'queued', clock() + 30);return True
-    by_index = {p['part']: p for p in parts}
+    data=json.loads(row['data']);thread_id=None
+    lanes={'channel':route['discord']}
+    if desired and data.get('schema',1)>=2 and data['thread']!=row['ts']:
+        try:
+            status,value=ensure_mirror_thread(store,row,policy,slack,discord)
+            if status!='ready':
+                store.finish(row,'uncertain' if status=='uncertain' else 'queued',
+                             clock()+(value if status=='rate_limited' else 2 if status in ('wait','changed') else 30),
+                             cooldown=status=='rate_limited')
+                return True
+            thread_id=value
+            if not discord.allowed(route['discord'],route['name'],thread=thread_id,uploads=any(p['files'] for p in desired)):
+                store.finish(row,'queued',clock()+30,cooldown=False);return True
+        except Exception:
+            store.finish(row,'queued',clock()+30,cooldown=False);return True
+        lanes={'thread':thread_id}
+        if data.get('broadcast'):lanes['channel']=route['discord']
+    targets={(lane,index):(destination,part) for lane,destination in lanes.items() for index,part in enumerate(desired)}
+    by_index = {(p['lane'],p['part']):p for p in parts}
     operation = None
     # Delete surplus parts before updates, including multipart shrink and full deletion.
     for p in reversed(parts):
-        if p['part'] >= len(desired) and p['state'] != 'deleted':
-            operation = ('DELETE', p['part'], p, None);break
+        if (p['lane'],p['part']) not in targets and p['state'] != 'deleted':
+            operation = ('DELETE',p['lane'],p['part'],p['destination'],p,None);break
     if operation is None:
-        for index, target_part in enumerate(desired):
-            p = by_index.get(index)
+        for (lane,index),(destination,target_part) in targets.items():
+            p = by_index.get((lane,index))
+            if p and p['destination']!=destination:
+                store.finish(row,'failed');return True
             if p is None or p['state'] == 'deleted' or p['digest'] != target_part['digest']:
-                operation = ('PATCH' if p and p['discord_id'] and p['state'] != 'deleted' else 'POST', index, p, target_part);break
+                operation = ('PATCH' if p and p['discord_id'] and p['state'] != 'deleted' else 'POST',lane,index,destination,p,target_part);break
     if operation is None:
         store.finish(row, 'clean');return True
-    method, index, old, target_part = operation
+    method,lane,index,destination,old,target_part=operation
+    if lane=='channel' and destination!=route['discord']:
+        store.finish(row,'failed');return True
+    if lane=='thread':
+        ledger=store.thread(row['channel'],data['thread'])
+        try:
+            permitted=bool(ledger and ledger['thread_id']==destination and
+                           discord.allowed(route['discord'],route['name'],thread=destination,uploads=bool(target_part and target_part['files'])))
+        except Exception:permitted=False
+        if not permitted:
+            store.finish(row,'queued',clock()+30,cooldown=False);return True
     ident = old['discord_id'] if old else None
     digest = target_part['digest'] if target_part else ''
     if method == 'DELETE' and ident is None:
         # A definitive rejection/429 never created a Discord object.
-        store.written(row, index, None, '', 'deleted')
+        store.written(row, index, None, '', 'deleted',lane=lane)
         store.finish(row, 'queued');return True
-    path = '/channels/' + route['discord'] + '/messages' + ('/' + ident if method != 'POST' else '')
+    path = '/channels/' + destination + '/messages' + ('/' + ident if method != 'POST' else '')
     body, files = None, []
     if target_part:
         body = {'content': target_part['content'], 'allowed_mentions': {'parse': [], 'users': [], 'roles': [], 'replied_user': False},
                 'flags': 4, 'attachments': []}
         if method == 'POST':
             body.update(nonce=hashlib.sha256((policy.team + ':' + row['channel'] + ':' + row['ts'] + ':'
-                                            + str(index) + ':' + str(row['generation'])).encode()).hexdigest()[:24], enforce_nonce=True)
+                                            +lane+':'+str(index)+':'+str(row['generation'])).encode()).hexdigest()[:24], enforce_nonce=True)
         try:
             files = [discord.download(f, slack.token) for f in target_part['files']]
             body['attachments'] = [{'id': i, 'filename': f[0]} for i, f in enumerate(files)]
         except Exception:
             store.finish(row, 'queued', clock() + 30);return True
-    store.begin_write(row, index, ident, digest)
+    store.begin_write(row,index,ident,digest,lane=lane,destination=destination)
     try:
         state, value = discord.call(method, path, body, files)
     except Exception:
@@ -970,19 +1196,19 @@ def process_mirror_one(store, policy, slack, discord, clock=None):
         if method != 'DELETE':
             ident = value.get('id')
             if (not isinstance(ident, str) or not SNOWFLAKE.fullmatch(ident)
-                    or value.get('channel_id') != route['discord'] or value.get('author', {}).get('id') != cfg.bot_user):
+                    or value.get('channel_id') != destination or value.get('author', {}).get('id') != cfg.bot_user):
                 state = 'uncertain'
         if state == 'sent':
-            store.written(row, index, ident, digest, 'deleted' if method == 'DELETE' else 'sent')
+            store.written(row,index,ident,digest,'deleted' if method=='DELETE' else 'sent',lane=lane)
             store.finish(row, 'queued');return True
     if state == 'rate_limited':
-        store.written(row, index, old['discord_id'] if old else None, old['digest'] if old else None, old['state'] if old else 'pending')
+        store.written(row,index,old['discord_id'] if old else None,old['digest'] if old else None,old['state'] if old else 'pending',lane=lane)
         store.finish(row, 'queued', clock() + value)
     elif state == 'failed':
-        store.written(row, index, ident, old['digest'] if old else None, 'failed')
+        store.written(row,index,ident,old['digest'] if old else None,'failed',lane=lane)
         store.finish(row, 'failed')
     else:
-        store.written(row, index, ident, digest, 'uncertain')
+        store.written(row,index,ident,digest,'uncertain',lane=lane)
         store.finish(row, 'uncertain')
     return True
 

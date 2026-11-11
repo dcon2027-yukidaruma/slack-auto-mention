@@ -70,14 +70,19 @@ def inspect():
                                          shared_channel_ids=(source['id'],) if source.get('is_ext_shared') else ())
             permission, _ = slack.conversation_allowed(scoped, source['id'])
             allowed = discord.allowed(destination['id'], name, uploads=True)
+            threads_allowed = discord.allowed(destination['id'], name, uploads=True, create_thread=True)
             entry.update(slack=source['id'], private=bool(source.get('is_private')),
                          shared=bool(source.get('is_ext_shared')), source_allowed=permission == 'allowed', discord_allowed=allowed,
                          mention_shared_opt_in=policy.allows_shared(source['id']))
+            entry['discord_threads_allowed'] = threads_allowed
             if permission == 'allowed' and allowed and not source.get('is_mpim'):
                 routes[source['id']] = {'name': name, 'discord': destination['id']}
                 if source.get('is_ext_shared'):shared.append(source['id'])
         results.append(entry)
+    profile_state,profile = slack.call('users.info',{'user':policy.bot_user})
     return {'checked_at': int(time.time()), 'posts': 0, 'writes': 0, 'inventory_complete': True,
+            'user_name_lookup_available': profile_state=='sent' and isinstance(profile.get('user'),dict) and profile['user'].get('id')==policy.bot_user if isinstance(profile,dict) else False,
+            'all_thread_permissions_verified': bool(results) and all(entry.get('discord_threads_allowed') for entry in results),
             'application': {'id': probe.application, 'name': app['name'], 'bot_user': probe.bot_user},
             'guild': probe.guild, 'category': category, 'channels': results,
             'all_category_text_channels_verified': bool(destinations) and len(routes) == len(destinations),

@@ -59,14 +59,16 @@ def run():
     state, identity = slack.call('auth.test', {})
     if state != 'sent' or identity.get('team_id') != cfg.team or identity.get('user_id') != cfg.bot_user:
         raise ValueError('Slack identity mismatch')
+    slack.workspace_url = identity.get('url', '')
     discord = DiscordMirror(mirror_cfg, existing_discord_token(home / '.config/dcon-projects/runtime.env'))
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     while not stop.is_set():
         try:
-            process_mirror_one(store, cfg, slack, discord)
-            store.heartbeat(time.time())
+            paused = (home / '.config/slack-auto-mention/mirror-worker.pause').exists()
+            if not paused:process_mirror_one(store, cfg, slack, discord)
+            store.heartbeat(time.time(),paused=paused)
         except sqlite3.Error:
             pass  # A stale heartbeat makes ingress health report unavailable.
         stop.wait(1.1)

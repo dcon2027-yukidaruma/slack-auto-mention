@@ -21,7 +21,7 @@ jobs:
       - name: Offline tests (no Slack messages)
         run: python3 -m unittest discover -s tests -v
       - name: Compile
-        run: python3 -m py_compile bot.py deploy/deploy.py deploy/container_entrypoint.py deploy/pull_cd.py deploy/roster_reader.py deploy/roster_projection.py deploy/roster_service.py deploy/mirror_worker.py scripts/scan_secrets.py
+        run: python3 -m py_compile bot.py deploy/deploy.py deploy/container_entrypoint.py deploy/pull_cd.py deploy/roster_reader.py deploy/roster_projection.py deploy/roster_service.py deploy/mirror_worker.py scripts/inspect_mirror.py scripts/scan_secrets.py
       - name: Validate unpublished container profile (dummy values only)
         env:
           SLACK_IMAGE: slack-auto-mention:offline-test
