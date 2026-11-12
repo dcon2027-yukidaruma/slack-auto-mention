@@ -80,13 +80,25 @@ unrelated history item. Other old unmirrored messages remain ineligible.
 Each post displays the sender's name as a clickable Slack profile link, message
 text and a source link. The profile URL uses only the workspace origin returned
 by authenticated `auth.test` and that sender's validated Slack user ID. Discord
-masked-link labels escape brackets, parentheses and backslashes; no ID suffix is
-displayed. Supplied Slack profile names are preferred; otherwise `users.info`
+masked-link labels escape Markdown punctuation rather than deleting it, so names
+such as `dev_ops` retain their underscores; no ID suffix is displayed. Outside
+backtick code spans/fences, `<@USERID>` mentions use the same resolved-name
+profile links. Escaped literal angle tokens and code contents are not interpreted
+as mentions. Unknown users retain a linked `Slack user` label. Profile links are
+never split across multipart boundaries. Supplied Slack profile names are preferred; otherwise `users.info`
 uses the existing bot token when `users:read` is available. Only display
 names/IDs/timestamps are cached, bounded to 2000 entries, with no email lookup or
 credential fallback. A missing profile scope/name uses the linked label
 `Slack user` and does not drop the message; report that limit rather than claim
 all names resolved. System messages without a valid user ID remain plain names.
+
+The lossless `mirror_profile_names` cache is separate from the legacy
+`mirror_authors` cache, whose names may already have lost punctuation. The old
+cache and all receipts are retained; no clean message is requeued. Names and body
+mention labels are frozen for one event generation so multipart retries remain
+consistent. Lookup work is limited to 100 distinct body mentions per generation;
+additional mentions use linked fallback labels. A future event retries unavailable
+names after the existing five-minute negative-cache interval.
 
 Top-level posts go to the mapped text channel. Replies go to the public Discord
 thread attached to the recorded first part of their parent. The thread has the
