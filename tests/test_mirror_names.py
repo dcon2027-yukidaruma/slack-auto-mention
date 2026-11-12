@@ -56,6 +56,45 @@ class NameTests(unittest.TestCase):
         with self.store.connect() as db:
             self.assertEqual(db.execute('SELECT name FROM mirror_profile_names WHERE user_id=?',(AUTHOR,)).fetchone()[0],'alice_dev')
 
+    def test_header_has_two_independent_links_and_no_duplicate_source_footer(self):
+        self.enqueue('body');self.drain()
+        expected=r'[alice\_dev](https://example.slack.com/team/U00000003) · [Slack](https://app.slack.com/archives/C00000001/p1793091836135859)'
+        self.assertEqual(self.contents()[0],expected+'\nbody')
+        self.assertEqual(self.contents()[0].count('https://app.slack.com/archives/'),1)
+
+    def test_wire_payload_keeps_single_markdown_escapes_and_never_reconverts_header_urls(self):
+        self.slack.names[AUTHOR]=r'dev\_ops_[a]'
+        self.enqueue('<@U00000004> <https://example.com|source_label>');self.drain()
+        payload=next(c[2] for c in self.discord.calls if c[2] and 'content' in c[2])
+        wire=json.loads(json.dumps(payload,ensure_ascii=False))
+        header,body=wire['content'].split('\n',1)
+        self.assertTrue(header.startswith(r'[dev\\\_ops\_\[a\]](https://example.slack.com/team/U00000003) · [Slack]('))
+        self.assertIn(r'[Bob\_Smith](https://example.slack.com/team/U00000004)',body)
+        self.assertIn('source_label (https://example.com)',body)
+        row=self.store.message('C00000001',ROOT)
+        self.assertEqual(mirror_parts(row,self.cfg,workspace_url=self.slack.workspace_url)[0]['content'],wire['content'])
+        self.assertEqual(mirror_parts(row,self.cfg,workspace_url=self.slack.workspace_url),mirror_parts(row,self.cfg,workspace_url=self.slack.workspace_url))
+
+    def test_long_multipart_header_remains_complete_within_utf16_limit(self):
+        self.slack.names[AUTHOR]='😀'*99+'_'
+        self.enqueue('😀'*3000+'<@U00000004>');self.drain()
+        for content in self.contents():
+            self.assertIn(' · [Slack](https://app.slack.com/archives/C00000001/p1793091836135859)\n',content)
+            self.assertEqual(content.count('https://app.slack.com/archives/'),1)
+            self.assertLessEqual(len(content.encode('utf-16-le'))//2,2000)
+
+    def test_broadcast_header_links_reply_source_in_both_copies_and_after_edit(self):
+        self.enqueue('root');self.drain()
+        reply=message('<@U00000004>',eid='EvReply',ts=REPLY)
+        reply['event'].update(thread_ts=ROOT,subtype='thread_broadcast')
+        self.store.enqueue(reply);self.drain()
+        expected=' · [Slack](https://app.slack.com/archives/C00000001/p'+REPLY.replace('.','')+')\n'
+        self.assertTrue(all(expected in content for content in self.contents()[-2:]))
+        edit=message('changed <@U00000005>',eid='EvEdit',ts=REPLY,kind='edit',version='1793092000.000000')
+        edit['event']['message']['thread_ts']=ROOT;self.store.enqueue(edit);self.drain()
+        self.assertTrue(all(expected in content for content in self.contents()[-2:]))
+        self.assertTrue(all(r'[Carol\_Test](' in content for content in self.contents()[-2:]))
+
     def test_multiple_mentions_deduplicate_lookup_and_reuse_sender_name(self):
         self.enqueue('<@U00000004> <@U00000003> <@U00000004|stale_label> <@W00000006>');self.drain()
         text=self.contents()[0]

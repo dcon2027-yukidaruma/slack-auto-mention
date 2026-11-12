@@ -77,8 +77,11 @@ tracked context message, so later live edits/deletes can update that one copy.
 An unavailable parent gets an explicit context placeholder rather than an
 unrelated history item. Other old unmirrored messages remain ineligible.
 
-Each post displays the sender's name as a clickable Slack profile link, message
-text and a source link. The profile URL uses only the workspace origin returned
+Each post starts with a clickable sender profile name, ` · `, then a `Slack`
+link to that exact source message, followed by the message text. Both links are
+constructed independently after body conversion, so neither passes through the
+Slack-token converter again. Every multipart copy retains this header; the raw
+source URL is not duplicated as a footer. The profile URL uses only the workspace origin returned
 by authenticated `auth.test` and that sender's validated Slack user ID. Discord
 masked-link labels escape Markdown punctuation rather than deleting it, so names
 such as `dev_ops` retain their underscores; no ID suffix is displayed. Outside

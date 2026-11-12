@@ -1065,10 +1065,10 @@ def mirror_parts(row, cfg, *, workspace_url=''):
     link = 'https://app.slack.com/archives/' + row['channel'] + '/p' + row['ts'].replace('.', '')
     ident = data.get('author_id') or (data.get('author') if MIRROR_USER.fullmatch(data.get('author','')) else '')
     name = data.get('author_name') or (data.get('author') if data.get('author') != ident else '') or 'Slack user'
-    header = mirror_profile_link(name,ident,workspace_url) + ' · Slack\n'
+    header = mirror_profile_link(name,ident,workspace_url) + ' · [Slack](' + link + ')\n'
     # UTF-16 units, rather than Python characters, match Discord's content limit.
     chunks, chunk, units = [], '', 0
-    budget = min(1600,2000-len((header+'\n'+link).encode('utf-16-le'))//2)
+    budget = min(1600,2000-len(header.encode('utf-16-le'))//2)
     if budget < 100:raise ValueError('Mirror header exceeds bounds')
     for piece,atomic in mirror_body_pieces(data['text'] or '[Attachment / empty message]',data.get('mention_names',{}),workspace_url):
         # Masked profile links are indivisible so a part boundary cannot break one.
@@ -1088,7 +1088,7 @@ def mirror_parts(row, cfg, *, workspace_url=''):
     if group:groups.append(group)
     result = []
     for i in range(max(len(chunks), len(groups))):
-        part = {'content': header + (chunks[i] if i < len(chunks) else '[Attachments continued]') + '\n' + link,
+        part = {'content': header + (chunks[i] if i < len(chunks) else '[Attachments continued]'),
                 'files': groups[i] if i < len(groups) else []}
         part['digest'] = hashlib.sha256(json.dumps(part, sort_keys=True).encode()).hexdigest()
         result.append(part)
