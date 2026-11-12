@@ -599,7 +599,63 @@ class MirrorConfig:
 
 
 def clean_mirror_name(value):
-    return re.sub(r'[\r\n`*_<>@]', '', value).strip()[:100] if isinstance(value,str) else ''
+    return re.sub(r'[\x00-\x1f\x7f]', '', value).strip()[:100] if isinstance(value,str) else ''
+
+
+MIRROR_USER = re.compile(r'[UW][A-Z0-9]{8,}\Z')
+MIRROR_MENTION = re.compile(r'<@([UW][A-Z0-9]{8,})(?:\|[^>\r\n]*)?>')
+
+
+def mirror_text_spans(text):
+    """Separate Slack backtick code spans before interpreting any angle tokens."""
+    runs=[]
+    for match in re.finditer(r'`+',text):
+        prefix=match.start()
+        while prefix and text[prefix-1]=='\\':prefix-=1
+        if (match.start()-prefix)%2==0:runs.append(match)
+    position=index=0
+    while index<len(runs):
+        opening=runs[index];width=len(opening[0]);closing=None
+        for candidate in range(index+1,len(runs)):
+            end=runs[candidate]
+            if width<3 and any(c in text[opening.end():end.start()] for c in '\r\n'):break
+            if len(end[0])==width or (width>=3 and len(end[0])>=width):
+                closing=candidate;break
+        if closing is None and width<3:
+            index+=1;continue
+        yield False,text[position:opening.start()]
+        position=runs[closing].end() if closing is not None else len(text)
+        yield True,text[opening.start():position]
+        if closing is None:return
+        index=closing+1
+    yield False,text[position:]
+
+
+def mirror_profile_link(name,ident,workspace_url):
+    # Preserve visible punctuation, escaping Discord Markdown only at rendering.
+    label=re.sub(r'([\\`*_\[\]()<>~|])',r'\\\1',clean_mirror_name(name) or 'Slack user')
+    if (isinstance(workspace_url,str) and re.fullmatch(r'https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.slack\.com/',workspace_url)
+            and isinstance(ident,str) and MIRROR_USER.fullmatch(ident)):
+        return '['+label+']('+workspace_url+'team/'+ident+')'
+    return label
+
+
+def mirror_body_pieces(text,names,workspace_url):
+    # A single pass prevents escaped literal tokens and generated links being re-parsed.
+    token=re.compile(r'<@([UW][A-Z0-9]{8,})(?:\|[^>\r\n]*)?>|<#[A-Z0-9]+\|([^>]+)>|<!(here|channel|everyone)>|<(https?://[^>|]+)(?:\|([^>]*))?>')
+    for code,span in mirror_text_spans(text):
+        if code:
+            yield html.unescape(span),False;continue
+        position=0
+        for match in token.finditer(span):
+            yield html.unescape(span[position:match.start()]),False
+            user,channel,broadcast,url,label=match.groups()
+            if user:yield mirror_profile_link(names.get(user) or 'Slack user',user,workspace_url),True
+            elif channel:yield '#'+html.unescape(channel),False
+            elif broadcast:yield '@channel',False
+            else:yield (html.unescape(label)+' ('+html.unescape(url)+')' if label else html.unescape(url)),False
+            position=match.end()
+        yield html.unescape(span[position:]),False
 
 
 def mirror_event(payload, cfg, policy, *, existing=False):
@@ -680,12 +736,13 @@ def mirror_event(payload, cfg, policy, *, existing=False):
     bot_profile = message.get('bot_profile')
     bot_name = bot_profile.get('name') if isinstance(bot_profile, dict) else None
     author_id = message.get('user') or (bot_profile.get('user_id') if isinstance(bot_profile, dict) else None)
-    if not isinstance(author_id, str) or not re.fullmatch(r'U[A-Z0-9]{8,}', author_id):author_id = ''
+    if not isinstance(author_id, str) or not MIRROR_USER.fullmatch(author_id):author_id = ''
     supplied_name = display or message.get('username') or bot_name or ''
     author = supplied_name or author_id or message.get('bot_id') or 'Slack'
-    author = re.sub(r'[\r\n`*_<>@]', '', str(author))[:100]
+    author = clean_mirror_name(str(author))
     data = {'text': text, 'files': files, 'author': author, 'thread': thread,
             'schema': 2, 'author_id': author_id, 'author_name': clean_mirror_name(supplied_name),
+            'author_name_format': 2 if supplied_name else 0,
             'thread_explicit': 'thread_ts' in message,
             'broadcast': subtype == 'thread_broadcast' or message.get('subtype') == 'thread_broadcast'
                          or message.get('reply_broadcast') is True,
@@ -738,6 +795,9 @@ class MirrorStore(Store):
                 channel TEXT, root_ts TEXT, starter_id TEXT NOT NULL, thread_id TEXT,
                 state TEXT NOT NULL, PRIMARY KEY(channel,root_ts))''')
             c.execute('CREATE TABLE IF NOT EXISTS mirror_authors (user_id TEXT PRIMARY KEY,name TEXT NOT NULL,checked REAL NOT NULL)')
+            # Old names were lossy (underscores removed). Keep that cache intact but
+            # resolve fresh names into a separate bounded cache; never requeue receipts.
+            c.execute('CREATE TABLE IF NOT EXISTS mirror_profile_names (user_id TEXT PRIMARY KEY,name TEXT NOT NULL,checked REAL NOT NULL)')
             if recover:
                 # Only the independently locked worker owns crash recovery.
                 c.execute("UPDATE mirror_messages SET state='queued' WHERE state='working'")
@@ -792,7 +852,9 @@ class MirrorStore(Store):
                     item['version'] = max(item['version'],row['version'])
                 if not item['data']['thread_explicit']:item['data']['thread'] = previous['thread']
                 if not item['data']['author_id']:item['data']['author_id'] = previous.get('author_id', '')
-                if not item['data']['author_name']:item['data']['author_name'] = previous.get('author_name', '')
+                if not item['data']['author_name']:
+                    item['data']['author_name'] = previous.get('author_name', '')
+                    item['data']['author_name_format'] = previous.get('author_name_format',0)
                 if 'root_data' not in item['data'] and 'root_data' in previous:item['data']['root_data']=previous['root_data']
                 if len(json.dumps(item['data']).encode())>512*1024:item['data'].pop('root_data',None)
                 if item['version'] < row['version'] and not item['deleted']:
@@ -867,19 +929,30 @@ class MirrorStore(Store):
 
     def resolve_author(self, row, slack, now):
         data = json.loads(row['data'])
-        ident = data.get('author_id') or (data.get('author') if re.fullmatch(r'U[A-Z0-9]{8,}', data.get('author','')) else '')
-        if not ident or data.get('author_name'):return row
-        with self.connect() as c:cached = c.execute('SELECT * FROM mirror_authors WHERE user_id=?', (ident,)).fetchone()
-        name = cached['name'] if cached else ''
-        if cached is None or now-cached['checked'] > (86400 if name else 300):
-            status, value = slack.call('users.info', {'user':ident})
-            if status == 'sent' and isinstance(value.get('user'),dict) and value['user'].get('id') == ident:
-                profile = value['user'].get('profile',{})
-                name = clean_mirror_name(profile.get('display_name') or profile.get('real_name') or value['user'].get('name')) or name
-            with self.connect() as c:
-                c.execute('INSERT INTO mirror_authors VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET name=excluded.name,checked=excluded.checked', (ident,name,now))
-                c.execute('DELETE FROM mirror_authors WHERE user_id IN (SELECT user_id FROM mirror_authors ORDER BY checked DESC LIMIT -1 OFFSET 2000)')
-        data.update(author_id=ident,author_name=name)
+        if data.get('names_generation')==row['generation'] and data.get('name_format')==2:return row
+        ident = data.get('author_id') or (data.get('author') if MIRROR_USER.fullmatch(data.get('author','')) else '')
+        def lookup(user):
+            with self.connect() as c:cached=c.execute('SELECT * FROM mirror_profile_names WHERE user_id=?',(user,)).fetchone()
+            name=cached['name'] if cached else ''
+            if cached is None or now-cached['checked']>(86400 if name else 300):
+                try:status,value=slack.call('users.info',{'user':user})
+                except Exception:status,value='failed',None
+                info=value.get('user') if isinstance(value,dict) else None
+                if status=='sent' and isinstance(info,dict) and info.get('id')==user:
+                    profile=info.get('profile') if isinstance(info.get('profile'),dict) else {}
+                    name=clean_mirror_name(profile.get('display_name') or profile.get('real_name') or info.get('name')) or name
+                with self.connect() as c:
+                    c.execute('INSERT INTO mirror_profile_names VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET name=excluded.name,checked=excluded.checked',(user,name,now))
+                    c.execute('DELETE FROM mirror_profile_names WHERE user_id IN (SELECT user_id FROM mirror_profile_names ORDER BY checked DESC LIMIT -1 OFFSET 2000)')
+            return name
+        name=data.get('author_name','') if data.get('author_name_format')==2 else ''
+        if ident and not name:name=lookup(ident)
+        names={ident:name} if ident else {}
+        users=dict.fromkeys(m[1] for code,span in mirror_text_spans(data['text']) if not code for m in MIRROR_MENTION.finditer(span))
+        for user in list(users)[:100]:
+            if user not in names:names[user]=lookup(user)
+        data.update(author_id=ident,author_name=name,author_name_format=2,mention_names=names,
+                    names_generation=row['generation'],name_format=2)
         with self.connect() as c:
             c.execute('UPDATE mirror_messages SET data=? WHERE channel=? AND ts=? AND generation=?',
                       (json.dumps(data),row['channel'],row['ts'],row['generation']))
@@ -989,32 +1062,22 @@ class DiscordMirror:
 
 def mirror_parts(row, cfg, *, workspace_url=''):
     data = json.loads(row['data'])
-    text = html.unescape(data['text'])
-    text = re.sub(r'<@([A-Z0-9]+)(?:\|[^>]+)?>', r'@\1', text)
-    text = re.sub(r'<#[A-Z0-9]+\|([^>]+)>', r'#\1', text)
-    text = re.sub(r'<!(?:here|channel|everyone)>', '@channel', text)
-    text = re.sub(r'<(https?://[^>|]+)\|([^>]+)>', r'\2 (\1)', text)
-    text = re.sub(r'<(https?://[^>]+)>', r'\1', text)
     link = 'https://app.slack.com/archives/' + row['channel'] + '/p' + row['ts'].replace('.', '')
-    ident = data.get('author_id') or (data.get('author') if re.fullmatch(r'U[A-Z0-9]{8,}',data.get('author','')) else '')
+    ident = data.get('author_id') or (data.get('author') if MIRROR_USER.fullmatch(data.get('author','')) else '')
     name = data.get('author_name') or (data.get('author') if data.get('author') != ident else '') or 'Slack user'
-    name = clean_mirror_name(name) or 'Slack user'
-    # Only the workspace origin returned by authenticated auth.test is trusted.
-    # Message-supplied names/URLs cannot choose the destination or break the label.
-    if (isinstance(workspace_url,str) and re.fullmatch(r'https://[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.slack\.com/',workspace_url)
-            and isinstance(ident,str) and re.fullmatch(r'U[A-Z0-9]{8,}',ident)):
-        label = re.sub(r'([\\\[\]()])', r'\\\1', name)
-        name = '[' + label + '](' + workspace_url + 'team/' + ident + ')'
-    header = name + ' · Slack\n'
+    header = mirror_profile_link(name,ident,workspace_url) + ' · Slack\n'
     # UTF-16 units, rather than Python characters, match Discord's content limit.
     chunks, chunk, units = [], '', 0
     budget = min(1600,2000-len((header+'\n'+link).encode('utf-16-le'))//2)
     if budget < 100:raise ValueError('Mirror header exceeds bounds')
-    for char in text or '[Attachment / empty message]':
-        width = len(char.encode('utf-16-le')) // 2
-        if units + width > budget:
-            chunks.append(chunk);chunk, units = '', 0
-        chunk += char;units += width
+    for piece,atomic in mirror_body_pieces(data['text'] or '[Attachment / empty message]',data.get('mention_names',{}),workspace_url):
+        # Masked profile links are indivisible so a part boundary cannot break one.
+        for atom in ([piece] if atomic else piece):
+            width = len(atom.encode('utf-16-le')) // 2
+            if units + width > budget:
+                chunks.append(chunk);chunk, units = '', 0
+            if width>budget:raise ValueError('Mirror link exceeds bounds')
+            chunk += atom;units += width
     chunks.append(chunk)
     # Bound each upload request to 10 files / 10 MiB; extra batches are durable parts.
     groups, group, size = [], [], 0
