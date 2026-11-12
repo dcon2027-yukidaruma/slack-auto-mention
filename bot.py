@@ -631,13 +631,16 @@ def mirror_text_spans(text):
     yield False,text[position:]
 
 
-def mirror_profile_link(name,ident,workspace_url):
-    # Preserve visible punctuation, escaping Discord Markdown only at rendering.
-    label=re.sub(r'([\\`*_\[\]()<>~|])',r'\\\1',clean_mirror_name(name) or 'Slack user')
+def mirror_profile_link(name,ident,workspace_url,*,mention=False):
+    # Link labels are literal display text. Formatting escapes such as \_ can
+    # become visible in Discord labels; escape only link-structure delimiters.
+    raw=clean_mirror_name(name) or 'Slack user'
+    raw=('@' if mention else '')+raw
     if (isinstance(workspace_url,str) and re.fullmatch(r'https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.slack\.com/',workspace_url)
             and isinstance(ident,str) and MIRROR_USER.fullmatch(ident)):
+        label=re.sub(r'([\\\[\]])',r'\\\1',raw)
         return '['+label+']('+workspace_url+'team/'+ident+')'
-    return label
+    return re.sub(r'([\\`*_\[\]()<>~|])',r'\\\1',raw)
 
 
 def mirror_body_pieces(text,names,workspace_url):
@@ -650,7 +653,7 @@ def mirror_body_pieces(text,names,workspace_url):
         for match in token.finditer(span):
             yield html.unescape(span[position:match.start()]),False
             user,channel,broadcast,url,label=match.groups()
-            if user:yield mirror_profile_link(names.get(user) or 'Slack user',user,workspace_url),True
+            if user:yield mirror_profile_link(names.get(user) or 'Slack user',user,workspace_url,mention=True),True
             elif channel:yield '#'+html.unescape(channel),False
             elif broadcast:yield '@channel',False
             else:yield (html.unescape(label)+' ('+html.unescape(url)+')' if label else html.unescape(url)),False

@@ -83,11 +83,13 @@ constructed independently after body conversion, so neither passes through the
 Slack-token converter again. Every multipart copy retains this header; the raw
 source URL is not duplicated as a footer. The profile URL uses only the workspace origin returned
 by authenticated `auth.test` and that sender's validated Slack user ID. Discord
-masked-link labels escape Markdown punctuation rather than deleting it, so names
-such as `dev_ops` retain their underscores; no ID suffix is displayed. Outside
-backtick code spans/fences, `<@USERID>` mentions use the same resolved-name
-profile links. Escaped literal angle tokens and code contents are not interpreted
-as mentions. Unknown users retain a linked `Slack user` label. Profile links are
+masked-link labels preserve literal formatting characters such as `_`; they are
+not rewritten as `\_`, which can appear visibly in Discord link labels. Only
+backslashes and square brackets that delimit a link are structurally escaped.
+No ID suffix is displayed. Outside backtick code spans/fences, `<@USERID>`
+mentions use `[@display_name](profile URL)`; the sender header gains no `@` prefix.
+Escaped literal angle tokens and code contents are not interpreted as mentions.
+Unknown body users retain a linked `@Slack user` label. Profile links are
 never split across multipart boundaries. Supplied Slack profile names are preferred; otherwise `users.info`
 uses the existing bot token when `users:read` is available. Only display
 names/IDs/timestamps are cached, bounded to 2000 entries, with no email lookup or

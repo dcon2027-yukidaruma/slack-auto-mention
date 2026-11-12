@@ -248,7 +248,8 @@ class MirrorTests(unittest.TestCase):
         self.store.enqueue(p);self.drain()
         text = next(c[2]['content'] for c in reversed(self.discord.calls) if c[2] and 'content' in c[2])
         self.assertIn('[Alice](https://example.slack.com/team/U00000003)', text)
-        self.assertEqual(text.count('[Alice](https://example.slack.com/team/U00000003)'),2)
+        self.assertEqual(text.count('[Alice](https://example.slack.com/team/U00000003)'),1)
+        self.assertIn('[@Alice](https://example.slack.com/team/U00000003)',text)
         self.assertNotIn('<@', text)
 
     def test_shared_mirror_opt_in_does_not_expand_mention_policy(self):

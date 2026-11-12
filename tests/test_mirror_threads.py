@@ -49,7 +49,7 @@ class ThreadTests(unittest.TestCase):
         p['event']['author_url']='https://evil.invalid/'
         self.store.enqueue(p);self.drain()
         content=self.content_writes()[0][2]['content']
-        self.assertTrue(content.startswith(r'[Alice\]\(https://evil.invalid/\) \[x\\y](https://example.slack.com/team/U00000003)'))
+        self.assertTrue(content.startswith(r'[Alice\](https://evil.invalid/) \[x\\y](https://example.slack.com/team/U00000003)'))
         self.assertNotIn('(U00000003)',content)
 
     def test_untrusted_workspace_origin_or_invalid_user_id_never_forms_profile_link(self):
